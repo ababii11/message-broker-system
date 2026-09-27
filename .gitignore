@@ -3,6 +3,12 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
+subscriber.py
+publisher.py
+*.db
+T.md
+test_smoke.py
+
 # User-specific files
 *.rsuser
 *.suo
