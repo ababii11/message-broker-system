@@ -331,20 +331,24 @@ class Broker:
         if not topic:
             await self._send(conn.writer, {"type": "error", "message": "publish requires 'topic'"})
             return
-        payload = msg.get("payload", msg.get("data"))
-        timestamp = datetime.now(timezone.utc).isoformat()
+        content = msg.get("content", msg.get("payload", ""))
+        sender_name = msg.get("sender", conn.peer)
+        
+        # Extragem timestamp din mesajul primit, sau generăm unul nou
+        timestamp = msg.get("timestamp", datetime.now(timezone.utc).isoformat())
+        
         envelope = {
             "type": "message",
             "topic": topic,
-            "payload": payload,
-            "publisher": conn.peer,
+            "content": content,
+            "sender": sender_name,
             "timestamp": timestamp,
         }
 
         message_id = await self._db(
             self._exec,
             "INSERT INTO messages(topic, payload, publisher, timestamp) VALUES (?, ?, ?, ?)",
-            (topic, json.dumps(payload), conn.peer, timestamp),
+            (topic, json.dumps(content), sender_name, timestamp),
         )
         await self._db(
             self._exec,
@@ -451,7 +455,7 @@ class Broker:
 
 async def main():
     parser = argparse.ArgumentParser(description="Pub/Sub message broker with persistent subscribers")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--db", default="broker_database.db", help="SQLite file (':memory:' for a non-persistent run)")
     args = parser.parse_args()
