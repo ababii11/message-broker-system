@@ -67,3 +67,19 @@ support natively, so no custom length-prefixing is needed.
 | `backlog_notice` | `topic`, `count` | sent right after `login_ok`, once per topic with pending backlog — "You have `count` messages from `topic`" |
 | `message` | `topic`, `payload`, `publisher`, `timestamp`, `backlog?` | a delivered message; `backlog: true` marks one pulled from the backlog rather than delivered live |
 | `error` | `message: str` | something was wrong with the last line sent (bad JSON, unknown type, not logged in, missing field) — the connection is **not** dropped |
+
+## Java receiver
+
+The receiver is a dependency-free Java TCP client. It logs in with a persistent
+subscriber username, subscribes to the requested topics, and prints broker
+events as they arrive, including messages queued while that subscriber was
+offline. Compile and run it from the repository root:
+
+```bash
+javac receiver/Receiver.java
+java -cp receiver Receiver student1 weather news --host 127.0.0.1 --port 9000
+```
+
+Start the broker first. A topic must have been registered or published before
+the receiver subscribes; otherwise the broker returns an `error` response for
+that topic. The username must not already have an active receiver connection.
