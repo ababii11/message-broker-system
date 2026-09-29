@@ -2,10 +2,27 @@ import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /** Persistent-identity interactive subscriber for the JSON-lines broker. */
 public final class Receiver {
     private static final long RECONNECT_DELAY_MS = 3000;
+    private static final BlockingQueue<InputLine> CONSOLE_INPUT = new LinkedBlockingQueue<>();
+    private static volatile boolean consoleReaderStarted;
+
+    private static final class InputLine {
+        final String line;
+        final boolean eof;
+        InputLine(String line, boolean eof) { this.line = line; this.eof = eof; }
+    }
+
+    private static final class BrokerEvent {
+        final String line;
+        final boolean closed;
+        BrokerEvent(String line, boolean closed) { this.line = line; this.closed = closed; }
+    }
 
     private Receiver() {}
 
@@ -38,6 +55,7 @@ public final class Receiver {
     }
 
     private static void run(String host, int port, String user, boolean noReconnect) throws InterruptedException {
+        startConsoleReader();
         while (true) {
             boolean quit;
             try {
@@ -56,94 +74,123 @@ public final class Receiver {
     }
 
     /** Returns true if the user asked to quit or stdin reached EOF. */
-    private static boolean session(String host, int port, String user) throws IOException {
+    private static boolean session(String host, int port, String user) throws IOException, InterruptedException {
         Socket socket = new Socket();
         socket.connect(new InetSocketAddress(host, port), 10000);
         socket.setTcpNoDelay(true);
         BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
         BufferedWriter out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+        BlockingQueue<BrokerEvent> brokerEvents = new LinkedBlockingQueue<>();
         try {
             send(out, Map.of("type", "login", "user", user));
             String line = in.readLine();
             if (line == null) throw new IOException("broker closed the connection during login");
             Map<String, Object> response = Json.object(line);
-            if (!"login_ok".equals(response.get("type"))) {
+            if (!"login_ok".equals(response.get("type")))
                 throw new SecurityException(String.valueOf(response.getOrDefault("message", "login rejected: " + response)));
-            }
             System.out.println("Logged in as '" + user + "'.");
             Object restored = response.get("subscribed_topics");
-            if (restored instanceof List<?> topics && !topics.isEmpty())
-                System.out.println("Restored subscriptions: " + topics);
+            if (restored instanceof List<?> topics && !topics.isEmpty()) System.out.println("Restored subscriptions: " + topics);
 
-            Thread reader = new Thread(() -> readMessages(in), "broker-reader");
+            Thread reader = new Thread(() -> readMessages(in, brokerEvents), "broker-reader");
             reader.setDaemon(true);
             reader.start();
             System.out.println("Type '?' for help");
-            try (BufferedReader console = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
-                String input;
-                while ((input = console.readLine()) != null) {
-                    String trimmed = input.trim();
-                    if (trimmed.isEmpty()) { prompt(); continue; }
-                    String[] parts = trimmed.split("\\s+");
-                    String cmd = parts[0].toLowerCase(Locale.ROOT);
-                    Map<String, Object> msg;
-                    switch (cmd) {
-                        case "#", "subscribe" -> {
-                            if (parts.length < 2) { System.out.println("usage: # <topic> [topic ...]"); prompt(); continue; }
-                            msg = new LinkedHashMap<>(); msg.put("type", "subscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
-                        }
-                        case "!", "unsubscribe" -> {
-                            if (parts.length < 2) { System.out.println("usage: ! <topic> [topic ...]"); prompt(); continue; }
-                            msg = new LinkedHashMap<>(); msg.put("type", "unsubscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
-                        }
-                        case "topics" -> msg = Map.of("type", "list_topics");
-                        case "backlog" -> {
-                            Object topic = null;
-                            if (parts.length >= 3 && parts[1].equals("--topic")) topic = parts[2];
-                            else if (parts.length == 2) topic = parts[1];
-                            msg = new LinkedHashMap<>(); msg.put("type", "backlog"); msg.put("topic", topic);
-                        }
-                        case "?" -> { help(); prompt(); continue; }
-                        case "quit" -> { return true; }
-                        default -> { System.out.println("unknown command"); prompt(); continue; }
-                    }
-                    send(out, msg);
-                    prompt();
+            prompt();
+            while (true) {
+                BrokerEvent event = brokerEvents.poll();
+                if (event != null) {
+                    if (event.closed) throw new IOException("broker closed the connection");
+                    printBrokerMessage(event.line);
                 }
-                return true;
+                InputLine input = CONSOLE_INPUT.poll(100, TimeUnit.MILLISECONDS);
+                if (input == null) continue;
+                if (input.eof) return true;
+                String trimmed = input.line.trim();
+                if (trimmed.isEmpty()) { prompt(); continue; }
+                String[] parts = trimmed.split("\\s+");
+                String cmd = parts[0].toLowerCase(Locale.ROOT);
+                Map<String, Object> msg;
+                switch (cmd) {
+                    case "#", "subscribe" -> {
+                        if (parts.length < 2) { System.out.println("usage: # <topic> [topic ...]"); prompt(); continue; }
+                        msg = new LinkedHashMap<>(); msg.put("type", "subscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
+                    }
+                    case "!", "unsubscribe" -> {
+                        if (parts.length < 2) { System.out.println("usage: ! <topic> [topic ...]"); prompt(); continue; }
+                        msg = new LinkedHashMap<>(); msg.put("type", "unsubscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
+                    }
+                    case "topics" -> msg = Map.of("type", "list_topics");
+                    case "backlog" -> {
+                        Object topic = null;
+                        if (parts.length >= 3 && parts[1].equals("--topic")) topic = parts[2];
+                        else if (parts.length == 2) topic = parts[1];
+                        msg = new LinkedHashMap<>(); msg.put("type", "backlog"); msg.put("topic", topic);
+                    }
+                    case "?" -> { help(); prompt(); continue; }
+                    case "quit" -> { return true; }
+                    default -> { System.out.println("unknown command"); prompt(); continue; }
+                }
+                try { send(out, msg); prompt(); }
+                catch (IOException e) { throw new IOException("connection to broker was lost: " + e.getMessage(), e); }
             }
         } finally {
             try { socket.close(); } catch (IOException ignored) {}
         }
     }
 
+    private static void startConsoleReader() {
+        if (consoleReaderStarted) return;
+        consoleReaderStarted = true;
+        Thread console = new Thread(() -> {
+            try (BufferedReader input = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = input.readLine()) != null) CONSOLE_INPUT.put(new InputLine(line, false));
+            } catch (IOException | InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            } finally { CONSOLE_INPUT.offer(new InputLine(null, true)); }
+        }, "console-reader");
+        console.setDaemon(true);
+        console.start();
+    }
+
     private static void send(BufferedWriter out, Map<String, ?> value) throws IOException {
         out.write(Json.stringify(value)); out.write('\n'); out.flush();
     }
 
-    private static void readMessages(BufferedReader in) {
+    private static void readMessages(BufferedReader in, BlockingQueue<BrokerEvent> events) {
         try {
             String line;
-            while ((line = in.readLine()) != null) {
-                Map<String, Object> msg;
-                try { msg = Json.object(line); } catch (RuntimeException e) { continue; }
-                String type = String.valueOf(msg.get("type"));
-                switch (type) {
-                    case "message" -> {
-                        String tag = Boolean.TRUE.equals(msg.get("backlog")) ? "backlog:" + msg.get("topic") : String.valueOf(msg.get("topic"));
-                        System.out.printf("\n[%s] %s  (from %s)%n> ", tag, msg.get("payload"), msg.get("publisher"));
-                    }
-                    case "ack" -> System.out.printf("%n[ack] %s%n> ", msg);
-                    case "topics" -> System.out.printf("%n[topics] %s%n> ", msg.get("topics"));
-                    case "backlog_notice" -> System.out.printf("%nYou have %s messages from %s%n> ", msg.get("count"), msg.get("topic"));
-                    case "error" -> System.out.printf("%n[error] %s%n> ", msg.get("message"));
-                }
-                System.out.flush();
+            while ((line = in.readLine()) != null) events.put(new BrokerEvent(line, false));
+        } catch (IOException | InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        } finally { events.offer(new BrokerEvent(null, true)); }
+    }
+
+    private static void printBrokerMessage(String line) {
+        Map<String, Object> msg;
+        try { msg = Json.object(line); } catch (RuntimeException e) { return; }
+        switch (String.valueOf(msg.get("type"))) {
+            case "message" -> {
+                String tag = Boolean.TRUE.equals(msg.get("backlog")) ? "backlog:" + msg.get("topic") : String.valueOf(msg.get("topic"));
+                Object payload = msg.containsKey("payload") ? msg.get("payload") : msg.get("content");
+                Object publisher = msg.containsKey("publisher") ? msg.get("publisher") : msg.get("sender");
+                System.out.printf("\n[%s] %s  (from %s)%n", tag, integerIfNumeric(payload), publisher);
             }
-            System.out.println("\n[broker connection closed]");
-        } catch (IOException e) {
-            System.out.println("\n[broker connection lost: " + e.getMessage() + "]");
+            case "ack" -> System.out.printf("%n[ack] %s%n", msg);
+            case "topics" -> System.out.printf("%n[topics] %s%n", msg.get("topics"));
+            case "backlog_notice" -> System.out.printf("%nYou have %s messages from %s%n", integerIfNumeric(msg.get("count")), msg.get("topic"));
+            case "error" -> System.out.printf("%n[error] %s%n", msg.get("message"));
         }
+        prompt();
+    }
+
+    private static Object integerIfNumeric(Object value) {
+        if (value instanceof String s && s.matches("-?(0|[1-9][0-9]*)")) {
+            try { return Integer.valueOf(s); } catch (NumberFormatException ignored) { return value; }
+        }
+        if (value instanceof Long n && n >= Integer.MIN_VALUE && n <= Integer.MAX_VALUE) return n.intValue();
+        return value;
     }
 
     private static void prompt() { System.out.print("> "); System.out.flush(); }
