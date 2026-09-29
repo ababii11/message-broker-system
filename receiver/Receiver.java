@@ -1,371 +1,231 @@
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.net.InetSocketAddress;
-import java.net.Socket;
+import java.io.*;
+import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.*;
 
-/** Interactive Java subscriber for the repository's newline-delimited JSON broker. */
+/** Persistent-identity interactive subscriber for the JSON-lines broker. */
 public final class Receiver {
-    private static final double RECONNECT_DELAY_SECONDS = 3.0;
-    private static final String END_OF_INPUT = new String("<end-of-input>");
-    private static final Pattern TYPE_FIELD = Pattern.compile("\"type\"\\s*:\\s*\"([^\"]+)\"");
-    private static final Pattern COUNT_FIELD = Pattern.compile("\"count\"\\s*:\\s*(\\d+)");
+    private static final long RECONNECT_DELAY_MS = 3000;
 
-    private Receiver() { }
+    private Receiver() {}
 
-    public static void main(String[] args) {
-        String host = "127.0.0.1";
+    public static void main(String[] args) throws InterruptedException {
+        String host = "127.0.0.1", user = null;
         int port = 9000;
-        String user = null;
-        boolean reconnect = true;
-
+        boolean noReconnect = false;
         try {
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
-                    case "--host": host = requireValue(args, ++i, "--host"); break;
-                    case "--port": port = Integer.parseInt(requireValue(args, ++i, "--port")); break;
-                    case "--user": user = requireValue(args, ++i, "--user"); break;
-                    case "--no-reconnect": reconnect = false; break;
-                    case "--help": usage(); return;
-                    default: throw new IllegalArgumentException("unknown option: " + args[i]);
+                    case "--host" -> host = args[++i];
+                    case "--port" -> port = Integer.parseInt(args[++i]);
+                    case "--user" -> user = args[++i];
+                    case "--no-reconnect" -> noReconnect = true;
+                    case "--help", "-h" -> { usage(); return; }
+                    default -> throw new IllegalArgumentException("unknown option: " + args[i]);
                 }
             }
-            if (user == null || user.trim().isEmpty()) throw new IllegalArgumentException("--user is required");
-            if (port < 1 || port > 65535) throw new IllegalArgumentException("port must be between 1 and 65535");
+            if (user == null || user.isBlank()) throw new IllegalArgumentException("--user is required");
+            run(host, port, user, noReconnect);
         } catch (IllegalArgumentException e) {
-            System.err.println("Error: " + e.getMessage());
+            System.err.println("error: " + e.getMessage());
             usage();
             System.exit(2);
-            return;
         }
-
-        BlockingQueue<String> commands = new LinkedBlockingQueue<>();
-        Thread consoleReader = new Thread(() -> readConsole(commands), "receiver-console-input");
-        consoleReader.setDaemon(true);
-        consoleReader.start();
-
-        while (true) {
-            try {
-                if (session(host, port, user, commands)) return;
-            } catch (LoginRejectedException e) {
-                System.err.println("[login failed] " + e.getMessage());
-                return;
-            } catch (IOException e) {
-                print("\n[connection lost: " + e.getMessage() + "]");
-            }
-
-            if (!reconnect) return;
-            print(String.format("[reconnecting in %.0f seconds...]", RECONNECT_DELAY_SECONDS));
-            try {
-                Thread.sleep((long) (RECONNECT_DELAY_SECONDS * 1000));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
-    }
-
-    /** Runs one login session. Returns true when the user explicitly exits. */
-    private static boolean session(String host, int port, String user, BlockingQueue<String> commands)
-            throws IOException, LoginRejectedException {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 5000);
-            socket.setKeepAlive(true);
-            BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            BufferedWriter output = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
-
-            send(output, "{\"type\":\"login\",\"user\":" + jsonString(user) + "}");
-            String loginReply = input.readLine();
-            if (loginReply == null) throw new IOException("broker closed the connection during login");
-            String loginType = messageType(loginReply);
-            if (!"login_ok".equals(loginType)) {
-                throw new LoginRejectedException(jsonStringField(loginReply, "message", loginReply));
-            }
-
-            print("Logged in as '" + user + "'.");
-            String restored = stringArrayField(loginReply, "subscribed_topics");
-            if (!restored.isEmpty()) print("Restored subscriptions: " + restored);
-
-            ExecutorService readerExecutor = Executors.newSingleThreadExecutor(r -> {
-                Thread thread = new Thread(r, "receiver-broker-reader");
-                thread.setDaemon(true);
-                return thread;
-            });
-            Future<?> readerTask = readerExecutor.submit(() -> readBroker(input));
-            print("Type '?' for help");
-
-            try {
-                while (!readerTask.isDone()) {
-                    String line;
-                    try {
-                        line = commands.poll(200, TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return true;
-                    }
-                    if (line == null) continue;
-                    if (line == END_OF_INPUT || line.equals("quit")) return true;
-                    sendCommand(output, line);
-                }
-                try {
-                    readerTask.get();
-                    throw new IOException("broker closed the connection");
-                } catch (java.util.concurrent.ExecutionException e) {
-                    Throwable cause = e.getCause();
-                    if (cause instanceof IOException) throw (IOException) cause;
-                    throw new IOException("error reading from broker", cause);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("interrupted while reading from broker", e);
-                }
-            } finally {
-                readerExecutor.shutdownNow();
-            }
-        }
-    }
-
-    private static void readConsole(BlockingQueue<String> commands) {
-        try (BufferedReader console = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
-            while (true) {
-                print("> ");
-                String line = console.readLine();
-                if (line == null) {
-                    commands.offer(END_OF_INPUT);
-                    return;
-                }
-                commands.put(line.trim());
-            }
-        } catch (IOException e) {
-            commands.offer(END_OF_INPUT);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private static void readBroker(BufferedReader input) {
-        try {
-            String line;
-            while ((line = input.readLine()) != null) printBrokerLine(line);
-            throw new IOException("broker closed the connection");
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static void sendCommand(BufferedWriter output, String line) throws IOException {
-        String trimmed = line.trim();
-        if (trimmed.isEmpty()) return;
-        String[] parts = trimmed.split("\\s+");
-        if (parts.length == 0 || parts[0].isEmpty()) return;
-        String command = parts[0].toLowerCase();
-        String json;
-
-        switch (command) {
-            case "#":
-            case "subscribe":
-                if (parts.length < 2) { print("usage: # <topic> [topic2 ...]"); return; }
-                json = topicCommand("subscribe", Arrays.copyOfRange(parts, 1, parts.length));
-                break;
-            case "!":
-            case "unsubscribe":
-                if (parts.length < 2) { print("usage: ! <topic> [topic2 ...]"); return; }
-                json = topicCommand("unsubscribe", Arrays.copyOfRange(parts, 1, parts.length));
-                break;
-            case "topics":
-                json = "{\"type\":\"list_topics\"}";
-                break;
-            case "backlog":
-                String topic = null;
-                if (parts.length == 2) topic = parts[1];
-                else if (parts.length == 3 && "--topic".equals(parts[1])) topic = parts[2];
-                else if (parts.length > 1) { print("usage: backlog [--topic <topic>]"); return; }
-                json = topic == null ? "{\"type\":\"backlog\"}"
-                        : "{\"type\":\"backlog\",\"topic\":" + jsonString(topic) + "}";
-                break;
-            case "?":
-            case "help":
-                help();
-                return;
-            case "quit":
-                return;
-            default:
-                print("unknown command; type '?' for help");
-                return;
-        }
-        send(output, json);
-    }
-
-    private static String topicCommand(String type, String[] topics) {
-        StringBuilder json = new StringBuilder("{\"type\":").append(jsonString(type)).append(",\"topics\":[");
-        for (int i = 0; i < topics.length; i++) {
-            if (i > 0) json.append(',');
-            json.append(jsonString(topics[i]));
-        }
-        return json.append("]}").toString();
-    }
-
-    private static void printBrokerLine(String line) {
-        String type = messageType(line);
-        switch (type) {
-            case "message":
-                String topic = jsonStringField(line, "topic", "?");
-                boolean backlog = line.contains("\"backlog\": true") || line.contains("\"backlog\":true");
-                String payload = displayJsonValue(jsonValueField(line, "payload",
-                        jsonValueField(line, "content", "null")));
-                String publisher = jsonStringField(line, "publisher", jsonStringField(line, "sender", "unknown"));
-                print("\n[" + (backlog ? "backlog:" : "") + topic + "] " + payload
-                        + "  (from " + publisher + ")\n> ");
-                break;
-            case "ack": print("\n[ack] " + line + "\n> "); break;
-            case "topics": print("\n[topics] " + line + "\n> "); break;
-            case "backlog_notice":
-                Matcher count = COUNT_FIELD.matcher(line);
-                print("\nYou have " + (count.find() ? count.group(1) : "some") + " messages from "
-                        + jsonStringField(line, "topic", "?") + "\n> ");
-                break;
-            case "error":
-                print("\n[error] " + jsonStringField(line, "message", line) + "\n> ");
-                break;
-            default: print("\n[broker] " + line + "\n> ");
-        }
-    }
-
-    private static String messageType(String json) {
-        Matcher matcher = TYPE_FIELD.matcher(json);
-        return matcher.find() ? matcher.group(1) : "";
-    }
-
-    private static String jsonStringField(String json, String field, String fallback) {
-        Pattern pattern = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
-        Matcher matcher = pattern.matcher(json);
-        return matcher.find() ? unescape(matcher.group(1)) : fallback;
-    }
-
-    /** Returns a JSON value as its original text, preserving objects and arrays. */
-    private static String jsonValueField(String json, String field, String fallback) {
-        Pattern pattern = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*");
-        Matcher matcher = pattern.matcher(json);
-        if (!matcher.find()) return fallback;
-        int start = matcher.end();
-        if (start >= json.length()) return fallback;
-        char first = json.charAt(start);
-        if (first == '\"') {
-            boolean escaped = false;
-            for (int i = start + 1; i < json.length(); i++) {
-                char c = json.charAt(i);
-                if (c == '\"' && !escaped) return json.substring(start, i + 1);
-                if (c == '\\' && !escaped) escaped = true;
-                else escaped = false;
-            }
-            return fallback;
-        }
-        if (first == '{' || first == '[') {
-            int depth = 0;
-            boolean inString = false;
-            boolean escaped = false;
-            for (int i = start; i < json.length(); i++) {
-                char c = json.charAt(i);
-                if (inString) {
-                    if (c == '\"' && !escaped) inString = false;
-                    if (c == '\\' && !escaped) escaped = true;
-                    else escaped = false;
-                } else if (c == '\"') {
-                    inString = true;
-                } else if (c == '{' || c == '[') {
-                    depth++;
-                } else if (c == '}' || c == ']') {
-                    depth--;
-                    if (depth == 0) return json.substring(start, i + 1);
-                }
-            }
-            return fallback;
-        }
-        int end = start;
-        while (end < json.length() && json.charAt(end) != ',' && json.charAt(end) != '}') end++;
-        return json.substring(start, end).trim();
-    }
-
-    private static String displayJsonValue(String value) {
-        if (value.length() >= 2 && value.charAt(0) == '\"' && value.charAt(value.length() - 1) == '\"') {
-            return unescape(value.substring(1, value.length() - 1));
-        }
-        return value;
-    }
-
-    private static String stringArrayField(String json, String field) {
-        Pattern pattern = Pattern.compile("\"" + Pattern.quote(field) + "\"\\s*:\\s*\\[([^]]*)\\]");
-        Matcher matcher = pattern.matcher(json);
-        return matcher.find() ? matcher.group(1).trim() : "";
-    }
-
-    private static String unescape(String value) {
-        return value.replace("\\\"", "\"").replace("\\\\", "\\")
-                .replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t");
-    }
-
-    private static String jsonString(String value) {
-        StringBuilder result = new StringBuilder("\"");
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            switch (c) {
-                case '"': result.append("\\\""); break;
-                case '\\': result.append("\\\\"); break;
-                case '\b': result.append("\\b"); break;
-                case '\f': result.append("\\f"); break;
-                case '\n': result.append("\\n"); break;
-                case '\r': result.append("\\r"); break;
-                case '\t': result.append("\\t"); break;
-                default:
-                    if (c < 0x20) result.append(String.format("\\u%04x", (int) c));
-                    else result.append(c);
-            }
-        }
-        return result.append('"').toString();
-    }
-
-    private static void send(BufferedWriter output, String json) throws IOException {
-        output.write(json);
-        output.newLine();
-        output.flush();
-    }
-
-    private static String requireValue(String[] args, int index, String option) {
-        if (index >= args.length) throw new IllegalArgumentException(option + " requires a value");
-        return args[index];
-    }
-
-    private static void help() {
-        print("  # <topic> [topic2 ...]   subscribe to topics");
-        print("  ! <topic> [topic2 ...]   unsubscribe from topics");
-        print("  topics                   list available topics");
-        print("  backlog [--topic <t>]    fetch queued messages");
-        print("  ?                        show this help");
-        print("  quit                     disconnect and exit");
     }
 
     private static void usage() {
-        System.out.println("Usage: java Receiver --user USER [--host HOST] [--port PORT] [--no-reconnect]");
-        System.out.println("Defaults: --host 127.0.0.1 --port 9000; reconnect every 3 seconds.");
+        System.out.println("Usage: java Receiver [--host HOST] [--port PORT] --user USER [--no-reconnect]");
     }
 
-    private static synchronized void print(String text) {
-        System.out.print(text);
-        System.out.flush();
+    private static void run(String host, int port, String user, boolean noReconnect) throws InterruptedException {
+        while (true) {
+            boolean quit;
+            try {
+                quit = session(host, port, user);
+            } catch (SecurityException e) {
+                System.out.println("[login failed] " + e.getMessage());
+                return;
+            } catch (IOException e) {
+                System.out.println("\n[connection lost: " + e.getMessage() + "]");
+                quit = false;
+            }
+            if (quit || noReconnect) return;
+            System.out.println("[reconnecting in 3s...]");
+            Thread.sleep(RECONNECT_DELAY_MS);
+        }
     }
 
-    private static final class LoginRejectedException extends Exception {
-        LoginRejectedException(String message) { super(message); }
+    /** Returns true if the user asked to quit or stdin reached EOF. */
+    private static boolean session(String host, int port, String user) throws IOException {
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress(host, port), 10000);
+        socket.setTcpNoDelay(true);
+        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+        BufferedWriter out = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+        try {
+            send(out, Map.of("type", "login", "user", user));
+            String line = in.readLine();
+            if (line == null) throw new IOException("broker closed the connection during login");
+            Map<String, Object> response = Json.object(line);
+            if (!"login_ok".equals(response.get("type"))) {
+                throw new SecurityException(String.valueOf(response.getOrDefault("message", "login rejected: " + response)));
+            }
+            System.out.println("Logged in as '" + user + "'.");
+            Object restored = response.get("subscribed_topics");
+            if (restored instanceof List<?> topics && !topics.isEmpty())
+                System.out.println("Restored subscriptions: " + topics);
+
+            Thread reader = new Thread(() -> readMessages(in), "broker-reader");
+            reader.setDaemon(true);
+            reader.start();
+            System.out.println("Type '?' for help");
+            try (BufferedReader console = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
+                String input;
+                while ((input = console.readLine()) != null) {
+                    String trimmed = input.trim();
+                    if (trimmed.isEmpty()) { prompt(); continue; }
+                    String[] parts = trimmed.split("\\s+");
+                    String cmd = parts[0].toLowerCase(Locale.ROOT);
+                    Map<String, Object> msg;
+                    switch (cmd) {
+                        case "#", "subscribe" -> {
+                            if (parts.length < 2) { System.out.println("usage: # <topic> [topic ...]"); prompt(); continue; }
+                            msg = new LinkedHashMap<>(); msg.put("type", "subscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
+                        }
+                        case "!", "unsubscribe" -> {
+                            if (parts.length < 2) { System.out.println("usage: ! <topic> [topic ...]"); prompt(); continue; }
+                            msg = new LinkedHashMap<>(); msg.put("type", "unsubscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
+                        }
+                        case "topics" -> msg = Map.of("type", "list_topics");
+                        case "backlog" -> {
+                            Object topic = null;
+                            if (parts.length >= 3 && parts[1].equals("--topic")) topic = parts[2];
+                            else if (parts.length == 2) topic = parts[1];
+                            msg = new LinkedHashMap<>(); msg.put("type", "backlog"); msg.put("topic", topic);
+                        }
+                        case "?" -> { help(); prompt(); continue; }
+                        case "quit" -> { return true; }
+                        default -> { System.out.println("unknown command"); prompt(); continue; }
+                    }
+                    send(out, msg);
+                    prompt();
+                }
+                return true;
+            }
+        } finally {
+            try { socket.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private static void send(BufferedWriter out, Map<String, ?> value) throws IOException {
+        out.write(Json.stringify(value)); out.write('\n'); out.flush();
+    }
+
+    private static void readMessages(BufferedReader in) {
+        try {
+            String line;
+            while ((line = in.readLine()) != null) {
+                Map<String, Object> msg;
+                try { msg = Json.object(line); } catch (RuntimeException e) { continue; }
+                String type = String.valueOf(msg.get("type"));
+                switch (type) {
+                    case "message" -> {
+                        String tag = Boolean.TRUE.equals(msg.get("backlog")) ? "backlog:" + msg.get("topic") : String.valueOf(msg.get("topic"));
+                        System.out.printf("\n[%s] %s  (from %s)%n> ", tag, msg.get("payload"), msg.get("publisher"));
+                    }
+                    case "ack" -> System.out.printf("%n[ack] %s%n> ", msg);
+                    case "topics" -> System.out.printf("%n[topics] %s%n> ", msg.get("topics"));
+                    case "backlog_notice" -> System.out.printf("%nYou have %s messages from %s%n> ", msg.get("count"), msg.get("topic"));
+                    case "error" -> System.out.printf("%n[error] %s%n> ", msg.get("message"));
+                }
+                System.out.flush();
+            }
+            System.out.println("\n[broker connection closed]");
+        } catch (IOException e) {
+            System.out.println("\n[broker connection lost: " + e.getMessage() + "]");
+        }
+    }
+
+    private static void prompt() { System.out.print("> "); System.out.flush(); }
+    private static void help() {
+        System.out.println("  # <t> / subscribe <t>       subscribe to topic <t>");
+        System.out.println("  ! <t> / unsubscribe <t>     unsubscribe from topic <t>");
+        System.out.println("  topics                      list all available topics");
+        System.out.println("  backlog [--topic <t>]       show backlog (all topics if omitted)");
+        System.out.println("  ?                           show this help");
+        System.out.println("  quit                        disconnect and exit");
+    }
+
+    /** Small dependency-free JSON reader/writer for the broker's JSON-lines protocol. */
+    private static final class Json {
+        static Map<String, Object> object(String s) {
+            Object value = new Parser(s).parse();
+            if (!(value instanceof Map<?, ?> map)) throw new IllegalArgumentException("JSON object expected");
+            Map<String, Object> result = new LinkedHashMap<>();
+            map.forEach((k, v) -> result.put(String.valueOf(k), v));
+            return result;
+        }
+        static String stringify(Object value) {
+            if (value == null) return "null";
+            if (value instanceof String s) return quote(s);
+            if (value instanceof Number || value instanceof Boolean) return value.toString();
+            if (value instanceof Map<?, ?> map) {
+                StringJoiner j = new StringJoiner(",", "{", "}");
+                map.forEach((k, v) -> j.add(quote(String.valueOf(k)) + ":" + stringify(v)));
+                return j.toString();
+            }
+            if (value instanceof Iterable<?> items) {
+                StringJoiner j = new StringJoiner(",", "[", "]");
+                for (Object item : items) j.add(stringify(item));
+                return j.toString();
+            }
+            throw new IllegalArgumentException("unsupported JSON value: " + value.getClass());
+        }
+        private static String quote(String s) {
+            StringBuilder b = new StringBuilder("\"");
+            for (char c : s.toCharArray()) {
+                switch (c) {
+                    case '"' -> b.append("\\\""); case '\\' -> b.append("\\\\");
+                    case '\b' -> b.append("\\b"); case '\f' -> b.append("\\f");
+                    case '\n' -> b.append("\\n"); case '\r' -> b.append("\\r"); case '\t' -> b.append("\\t");
+                    default -> { if (c < 0x20) b.append(String.format("\\u%04x", (int)c)); else b.append(c); }
+                }
+            }
+            return b.append('"').toString();
+        }
+        private static final class Parser {
+            final String s; int i;
+            Parser(String s) { this.s = s; }
+            Object parse() { Object v = value(); ws(); if (i != s.length()) fail(); return v; }
+            Object value() {
+                ws(); if (i >= s.length()) return fail(); char c = s.charAt(i);
+                if (c == '"') return string();
+                if (c == '{') { i++; Map<String,Object> m = new LinkedHashMap<>(); ws(); if (take('}')) return m; do { ws(); String k = string(); ws(); require(':'); m.put(k, value()); ws(); if (take('}')) return m; require(','); } while (true); }
+                if (c == '[') { i++; List<Object> a = new ArrayList<>(); ws(); if (take(']')) return a; do { a.add(value()); ws(); if (take(']')) return a; require(','); } while (true); }
+                if (s.startsWith("true", i)) { i += 4; return true; }
+                if (s.startsWith("false", i)) { i += 5; return false; }
+                if (s.startsWith("null", i)) { i += 4; return null; }
+                int start = i; if (take('-')) {} while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+                if (take('.')) while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+                if (i < s.length() && (s.charAt(i) == 'e' || s.charAt(i) == 'E')) { i++; if (i < s.length() && (s.charAt(i) == '+' || s.charAt(i) == '-')) i++; while (i < s.length() && Character.isDigit(s.charAt(i))) i++; }
+                if (start == i) return fail(); String n = s.substring(start, i);
+                try { return n.contains(".") || n.contains("e") || n.contains("E") ? Double.parseDouble(n) : Long.parseLong(n); }
+                catch (NumberFormatException e) { return fail(); }
+            }
+            String string() {
+                require('"'); StringBuilder b = new StringBuilder();
+                while (i < s.length()) { char c = s.charAt(i++); if (c == '"') return b.toString();
+                    if (c == '\\') { if (i >= s.length()) return fail(); char e = s.charAt(i++); switch (e) {
+                        case '"', '\\', '/' -> b.append(e); case 'b' -> b.append('\b'); case 'f' -> b.append('\f'); case 'n' -> b.append('\n'); case 'r' -> b.append('\r'); case 't' -> b.append('\t');
+                        case 'u' -> { if (i + 4 > s.length()) return fail(); try { b.append((char)Integer.parseInt(s.substring(i, i + 4), 16)); } catch (NumberFormatException ex) { return fail(); } i += 4; }
+                        default -> { return fail(); }
+                    }} else { if (c < 0x20) return fail(); b.append(c); }
+                } return fail();
+            }
+            void ws() { while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++; }
+            boolean take(char c) { if (i < s.length() && s.charAt(i) == c) { i++; return true; } return false; }
+            void require(char c) { if (!take(c)) fail(); }
+            <T> T fail() { throw new IllegalArgumentException("invalid JSON at offset " + i); }
+        }
     }
 }
