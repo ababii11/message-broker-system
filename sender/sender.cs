@@ -1,9 +1,11 @@
+#nullable disable
 using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using System.Threading;
 
 namespace MessageBroker.Sender
 {
@@ -94,53 +96,68 @@ namespace MessageBroker.Sender
             }
         }
 
+        static int globalSenderCounter = 0;
+
         static void RunSpawner()
         {
             Console.WriteLine("=== MASTER SENDER ===");
-            Console.Write("Introdu X (numarul de terminale cu senderi pe care doriti sa le deschideti): ");
-            if (!int.TryParse(Console.ReadLine(), out int x) || x <= 0)
-            {
-                Console.WriteLine("Numar invalid. Se va folosi X = 2.");
-                x = 2;
-            }
-
+            
             // Identificam cum a fost pornit programul (.exe direct sau prin dotnet run)
             string exePath = Process.GetCurrentProcess().MainModule.FileName;
             string dllPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
             bool isDotNet = exePath.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase);
 
-            for (int i = 1; i <= x; i++)
+            while (true)
             {
-                int port = 51000 + i;
-                ProcessStartInfo psi = new ProcessStartInfo();
+                Console.WriteLine("\n------------------------------------------------");
+                Console.Write("Introdu numarul de noi terminale cu senderi pe care doriti sa le deschideti (sau 'q' pt a iesi): ");
+                string input = Console.ReadLine()?.Trim();
                 
-                if (isDotNet)
+                if (input.ToLower() == "q" || input.ToLower() == "quit" || input.ToLower() == "exit")
                 {
-                    psi.FileName = exePath;
-                    psi.Arguments = $"\"{dllPath}\" child {i} {port}";
+                    break;
                 }
-                else
-                {
-                    psi.FileName = exePath;
-                    psi.Arguments = $"child {i} {port}";
-                }
-                
-                // Setarea magica pe Windows: deschide fizic o fereastra CMD noua pentru fiecare proces
-                psi.UseShellExecute = true; 
-                
-                try
-                {
-                    Process.Start(psi);
-                }
-                catch(Exception e)
-                {
-                    Console.WriteLine($"Eroare la deschiderea terminalului {i}: {e.Message}");
-                }
-            }
 
-            Console.WriteLine($"\n[INFO] Au fost deschise {x} ferestre noi separate.");
-            Console.WriteLine("Poti minimiza sau inchide aceasta fereastra principala. Mergi la ferestrele nou deschise pentru a scrie mesaje.");
-            Console.ReadLine();
+                if (!int.TryParse(input, out int x) || x <= 0)
+                {
+                    Console.WriteLine("Numar invalid. Incearca din nou.");
+                    continue;
+                }
+
+                for (int i = 1; i <= x; i++)
+                {
+                    globalSenderCounter++;
+                    int port = 51000 + globalSenderCounter;
+                    
+                    ProcessStartInfo psi = new ProcessStartInfo();
+                    
+                    if (isDotNet)
+                    {
+                        psi.FileName = exePath;
+                        psi.Arguments = $"\"{dllPath}\" child {globalSenderCounter} {port}";
+                    }
+                    else
+                    {
+                        psi.FileName = exePath;
+                        psi.Arguments = $"child {globalSenderCounter} {port}";
+                    }
+                    
+                    // Setarea magica pe Windows: deschide fizic o fereastra CMD noua pentru fiecare proces
+                    psi.UseShellExecute = true; 
+                    
+                    try
+                    {
+                        Process.Start(psi);
+                    }
+                    catch(Exception e)
+                    {
+                        Console.WriteLine($"Eroare la deschiderea terminalului {globalSenderCounter}: {e.Message}");
+                    }
+                }
+
+                Console.WriteLine($"\n[INFO] Au fost deschise {x} ferestre noi separate (Sender {globalSenderCounter - x + 1} -> {globalSenderCounter}).");
+                Console.WriteLine("Poti continua sa adaugi terminale oricand doresti direct de aici.");
+            }
         }
 
         static void RunInteractiveChild(int senderId, int localPort)
@@ -149,52 +166,56 @@ namespace MessageBroker.Sender
             int brokerPort = 9000;
             string senderName = $"Sender-{senderId}";
 
-            Console.Title = $"Terminal - {senderName} (Port local: {localPort})";
+            Console.Title = $"Terminal - {senderName}";
             Console.WriteLine(new string('=', 50));
             Console.WriteLine($" TERMINAL SENDER INTERACTIV | {senderName} ");
             Console.WriteLine(new string('=', 50));
+            Console.WriteLine("Tasteaza 'exit' la topic pentru a inchide fereastra.\n");
 
-            try
+            while (true)
             {
-                using (var client = new BrokerClient(localPort))
+                try
                 {
-                    client.Connect(host, brokerPort, senderName);
-                    Console.WriteLine($"[+] Conectat la Brokerul de pe {host}:{brokerPort}");
-                    Console.WriteLine($"[+] Portul Meu Local: {client.GetLocalEndpoint()}\n");
-
-                    while (true)
+                    using (var client = new BrokerClient(localPort))
                     {
-                        Console.Write("Topic-ul (ex: sport, weather, music, etc.): ");
-                        string topic = Console.ReadLine()?.Trim();
-                        
-                        if (string.IsNullOrEmpty(topic)) continue;
+                        client.Connect(host, brokerPort, senderName);
+                        Console.WriteLine($"[+] Conectat la Brokerul de pe {host}:{brokerPort}");
+                        Console.WriteLine($"[+] Portul Meu Local: {client.GetLocalEndpoint()}\n");
 
-                        Console.Write($"Mesajul de transmis catre topicul '{topic}': ");
-                        string content = Console.ReadLine()?.Trim();
-
-                        if (string.IsNullOrEmpty(content)) continue;
-
-                        try
+                        while (true)
                         {
+                            Console.Write("Topic-ul (ex: sport, weather, etc.): ");
+                            string topic = Console.ReadLine()?.Trim();
+                            
+                            if (string.IsNullOrEmpty(topic)) continue;
+                            if (topic.ToLower() == "exit" || topic.ToLower() == "quit") return;
+
+                            Console.Write($"Mesajul de transmis catre topicul '{topic}': ");
+                            string content = Console.ReadLine()?.Trim();
+
+                            if (string.IsNullOrEmpty(content)) continue;
+
                             string response = client.Publish(topic, content);
+                            if (response == null)
+                            {
+                                throw new IOException("Brokerul a intrerupt conexiunea (EOF).");
+                            }
+                            
                             Console.WriteLine($"  -> [Broker a confirmat]: {response}\n");
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"  -> [Eroare la trimitere]: {ex.Message}");
-                            break;
                         }
                     }
                 }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"\n[!] Eroare de conexiune / Broker picat: {ex.Message}");
+                    Console.WriteLine("[*] Reincercam reconectarea automata in 3 secunde...");
+                    Thread.Sleep(3000);
+                    
+                    // Incrementam portul local pentru reconectare, 
+                    // pentru a evita blocajele de tip "Address in use (TIME_WAIT)"
+                    localPort++; 
+                }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"\n[!] Eroare de conexiune: {ex.Message}");
-                Console.WriteLine("Ai pornit broker.py in prealabil?");
-            }
-            
-            Console.WriteLine("\nApasa orice tasta pentru a inchide terminalul...");
-            Console.ReadKey();
         }
     }
 }
