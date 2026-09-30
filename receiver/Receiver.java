@@ -90,7 +90,11 @@ public final class Receiver {
                 throw new SecurityException(String.valueOf(response.getOrDefault("message", "login rejected: " + response)));
             System.out.println("Logged in as '" + user + "'.");
             Object restored = response.get("subscribed_topics");
-            if (restored instanceof List<?> topics && !topics.isEmpty()) System.out.println("Restored subscriptions: " + topics);
+            Set<String> subscribedTopics = new LinkedHashSet<>();
+            if (restored instanceof List<?> topics) {
+                for (Object topic : topics) subscribedTopics.add(String.valueOf(topic));
+                if (!topics.isEmpty()) System.out.println("Restored subscriptions: " + topics);
+            }
 
             Thread reader = new Thread(() -> readMessages(in, brokerEvents), "broker-reader");
             reader.setDaemon(true);
@@ -101,7 +105,7 @@ public final class Receiver {
                 BrokerEvent event = brokerEvents.poll();
                 if (event != null) {
                     if (event.closed) throw new IOException("broker closed the connection");
-                    printBrokerMessage(event.line);
+                    printBrokerMessage(event.line, subscribedTopics);
                 }
                 InputLine input = CONSOLE_INPUT.poll(100, TimeUnit.MILLISECONDS);
                 if (input == null) continue;
@@ -112,6 +116,11 @@ public final class Receiver {
                 String cmd = parts[0].toLowerCase(Locale.ROOT);
                 Map<String, Object> msg;
                 switch (cmd) {
+                    case "*" -> {
+                        System.out.println("Subscribed topics: " + (subscribedTopics.isEmpty() ? "none" : subscribedTopics));
+                        prompt();
+                        continue;
+                    }
                     case "#", "subscribe" -> {
                         if (parts.length < 2) { System.out.println("usage: # <topic> [topic ...]"); prompt(); continue; }
                         msg = new LinkedHashMap<>(); msg.put("type", "subscribe"); msg.put("topics", Arrays.asList(parts).subList(1, parts.length));
@@ -167,10 +176,22 @@ public final class Receiver {
         } finally { events.offer(new BrokerEvent(null, true)); }
     }
 
-    private static void printBrokerMessage(String line) {
+    private static void printBrokerMessage(String line, Set<String> subscribedTopics) {
         Map<String, Object> msg;
         try { msg = Json.object(line); } catch (RuntimeException e) { return; }
-        switch (String.valueOf(msg.get("type"))) {
+        String type = String.valueOf(msg.get("type"));
+        if ("ack".equals(type)) {
+            Object action = msg.get("action");
+            Object topics = msg.get("topics");
+            if (topics instanceof List<?> names) {
+                for (Object name : names) {
+                    String topic = String.valueOf(name);
+                    if ("subscribe".equals(action)) subscribedTopics.add(topic);
+                    else if ("unsubscribe".equals(action)) subscribedTopics.remove(topic);
+                }
+            }
+        }
+        switch (type) {
             case "message" -> {
                 String tag = Boolean.TRUE.equals(msg.get("backlog")) ? "backlog:" + msg.get("topic") : String.valueOf(msg.get("topic"));
                 Object payload = msg.containsKey("payload") ? msg.get("payload") : msg.get("content");
@@ -195,6 +216,7 @@ public final class Receiver {
 
     private static void prompt() { System.out.print("> "); System.out.flush(); }
     private static void help() {
+        System.out.println("  *                           show your subscribed topics");
         System.out.println("  # <t> / subscribe <t>       subscribe to topic <t>");
         System.out.println("  ! <t> / unsubscribe <t>     unsubscribe from topic <t>");
         System.out.println("  topics                      list all available topics");
