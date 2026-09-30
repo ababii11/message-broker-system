@@ -256,7 +256,12 @@ public final class Receiver {
                 if (take('.')) while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
                 if (i < s.length() && (s.charAt(i) == 'e' || s.charAt(i) == 'E')) { i++; if (i < s.length() && (s.charAt(i) == '+' || s.charAt(i) == '-')) i++; while (i < s.length() && Character.isDigit(s.charAt(i))) i++; }
                 if (start == i) return fail(); String n = s.substring(start, i);
-                try { return n.contains(".") || n.contains("e") || n.contains("E") ? Double.parseDouble(n) : Long.parseLong(n); }
+                try {
+                    if (n.contains(".") || n.contains("e") || n.contains("E")) return Double.parseDouble(n);
+                    long integer = Long.parseLong(n);
+                    if (integer >= Integer.MIN_VALUE && integer <= Integer.MAX_VALUE) return Integer.valueOf((int) integer);
+                    return Long.valueOf(integer);
+                }
                 catch (NumberFormatException e) { return fail(); }
             }
             String string() {
