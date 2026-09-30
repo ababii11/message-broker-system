@@ -170,50 +170,87 @@ namespace MessageBroker.Sender
             Console.WriteLine(new string('=', 50));
             Console.WriteLine($" TERMINAL SENDER INTERACTIV | {senderName} ");
             Console.WriteLine(new string('=', 50));
-            Console.WriteLine("Tasteaza 'exit' la topic pentru a inchide fereastra.\n");
+            
+            string topic = "";
+            Mutex topicMutex = null;
 
+            // 1. Alegerea unica a topicului per terminal
             while (true)
             {
-                try
+                Console.Write("Alege Topic-ul UNIC pentru acest terminal (ex: sport): ");
+                topic = Console.ReadLine()?.Trim().ToLower();
+                
+                if (string.IsNullOrEmpty(topic)) continue;
+                if (topic == "exit" || topic == "quit") return;
+
+                bool createdNew;
+                // Creăm un Mutex la nivel de sistem de operare (Windows) pentru acest topic
+                topicMutex = new Mutex(true, "Global\\PAD_BrokerTopic_" + topic, out createdNew);
+
+                if (!createdNew)
                 {
-                    using (var client = new BrokerClient(localPort))
+                    Console.WriteLine($"[-] Eroare: Topicul '{topic}' este deja preluat de un alt terminal activ!");
+                    topicMutex.Close();
+                    topicMutex = null;
+                }
+                else
+                {
+                    Console.WriteLine($"[+] Ai blocat exclusiv topicul '{topic}'. Toate mesajele de aici vor merge pe el.\n");
+                    break;
+                }
+            }
+
+            Console.WriteLine("Tasteaza 'exit' in loc de mesaj pentru a inchide fereastra.\n");
+
+            try
+            {
+                while (true)
+                {
+                    try
                     {
-                        client.Connect(host, brokerPort, senderName);
-                        Console.WriteLine($"[+] Conectat la Brokerul de pe {host}:{brokerPort}");
-                        Console.WriteLine($"[+] Portul Meu Local: {client.GetLocalEndpoint()}\n");
-
-                        while (true)
+                        using (var client = new BrokerClient(localPort))
                         {
-                            Console.Write("Topic-ul (ex: sport, weather, etc.): ");
-                            string topic = Console.ReadLine()?.Trim();
-                            
-                            if (string.IsNullOrEmpty(topic)) continue;
-                            if (topic.ToLower() == "exit" || topic.ToLower() == "quit") return;
+                            client.Connect(host, brokerPort, senderName);
+                            Console.WriteLine($"[+] Conectat la Brokerul de pe {host}:{brokerPort}");
+                            Console.WriteLine($"[+] Portul Meu Local: {client.GetLocalEndpoint()}\n");
 
-                            Console.Write($"Mesajul de transmis catre topicul '{topic}': ");
-                            string content = Console.ReadLine()?.Trim();
-
-                            if (string.IsNullOrEmpty(content)) continue;
-
-                            string response = client.Publish(topic, content);
-                            if (response == null)
+                            // 2. Bucla infinita doar pentru mesaje
+                            while (true)
                             {
-                                throw new IOException("Brokerul a intrerupt conexiunea (EOF).");
+                                Console.Write($"Mesajul pentru '{topic}': ");
+                                string content = Console.ReadLine()?.Trim();
+
+                                if (string.IsNullOrEmpty(content)) continue;
+                                if (content.ToLower() == "exit" || content.ToLower() == "quit") return;
+
+                                string response = client.Publish(topic, content);
+                                if (response == null)
+                                {
+                                    throw new IOException("Brokerul a intrerupt conexiunea (EOF).");
+                                }
+                                
+                                Console.WriteLine($"  -> [Broker a confirmat]: {response}\n");
                             }
-                            
-                            Console.WriteLine($"  -> [Broker a confirmat]: {response}\n");
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"\n[!] Eroare de conexiune / Broker picat: {ex.Message}");
+                        Console.WriteLine("[*] Reincercam reconectarea automata in 3 secunde...");
+                        Thread.Sleep(3000);
+                        
+                        // Incrementam portul local pentru a evita TIME_WAIT blocaj la reconectare
+                        localPort++; 
+                    }
                 }
-                catch (Exception ex)
+            }
+            finally
+            {
+                // Cand terminalul este oprit, eliberam automat topicul pentru ceilalti
+                if (topicMutex != null)
                 {
-                    Console.WriteLine($"\n[!] Eroare de conexiune / Broker picat: {ex.Message}");
-                    Console.WriteLine("[*] Reincercam reconectarea automata in 3 secunde...");
-                    Thread.Sleep(3000);
-                    
-                    // Incrementam portul local pentru reconectare, 
-                    // pentru a evita blocajele de tip "Address in use (TIME_WAIT)"
-                    localPort++; 
+                    topicMutex.ReleaseMutex();
+                    topicMutex.Close();
                 }
             }
         }
