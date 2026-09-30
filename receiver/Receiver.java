@@ -91,6 +91,7 @@ public final class Receiver {
             System.out.println("Logged in as '" + user + "'.");
             Object restored = response.get("subscribed_topics");
             Set<String> subscribedTopics = new LinkedHashSet<>();
+            Map<String, Integer> backlogCounts = new LinkedHashMap<>();
             if (restored instanceof List<?> topics) {
                 for (Object topic : topics) subscribedTopics.add(String.valueOf(topic));
                 if (!topics.isEmpty()) System.out.println("Restored subscriptions: " + topics);
@@ -105,7 +106,7 @@ public final class Receiver {
                 BrokerEvent event = brokerEvents.poll();
                 if (event != null) {
                     if (event.closed) throw new IOException("broker closed the connection");
-                    printBrokerMessage(event.line, subscribedTopics);
+                    printBrokerMessage(event.line, subscribedTopics, backlogCounts);
                 }
                 InputLine input = CONSOLE_INPUT.poll(100, TimeUnit.MILLISECONDS);
                 if (input == null) continue;
@@ -131,9 +132,24 @@ public final class Receiver {
                     }
                     case "topics" -> msg = Map.of("type", "list_topics");
                     case "backlog" -> {
-                        Object topic = null;
-                        if (parts.length >= 3 && parts[1].equals("--topic")) topic = parts[2];
-                        else if (parts.length == 2) topic = parts[1];
+                        if (parts.length == 1) {
+                            if (backlogCounts.isEmpty()) {
+                                System.out.println("You have no backlogged messages.");
+                            } else {
+                                backlogCounts.forEach((topic, count) ->
+                                    System.out.printf("You have %d messages from %s%n", count, topic));
+                            }
+                            prompt();
+                            continue;
+                        }
+                        Object topic;
+                        if (parts.length == 2 && parts[1].equals("--all")) topic = null;
+                        else if (parts.length == 3 && parts[1].equals("--topic")) topic = parts[2];
+                        else {
+                            System.out.println("usage: backlog | backlog --all | backlog --topic <topic>");
+                            prompt();
+                            continue;
+                        }
                         msg = new LinkedHashMap<>(); msg.put("type", "backlog"); msg.put("topic", topic);
                     }
                     case "?" -> { help(); prompt(); continue; }
@@ -176,10 +192,25 @@ public final class Receiver {
         } finally { events.offer(new BrokerEvent(null, true)); }
     }
 
-    private static void printBrokerMessage(String line, Set<String> subscribedTopics) {
+    private static void printBrokerMessage(String line, Set<String> subscribedTopics,
+                                           Map<String, Integer> backlogCounts) {
         Map<String, Object> msg;
         try { msg = Json.object(line); } catch (RuntimeException e) { return; }
         String type = String.valueOf(msg.get("type"));
+        if ("backlog_notice".equals(type)) {
+            Object topic = msg.get("topic");
+            Object count = msg.get("count");
+            if (topic != null && count instanceof Number number && number.intValue() > 0)
+                backlogCounts.put(String.valueOf(topic), number.intValue());
+        }
+        if ("message".equals(type) && Boolean.TRUE.equals(msg.get("backlog"))) {
+            String topic = String.valueOf(msg.get("topic"));
+            Integer remaining = backlogCounts.get(topic);
+            if (remaining != null) {
+                if (remaining <= 1) backlogCounts.remove(topic);
+                else backlogCounts.put(topic, remaining - 1);
+            }
+        }
         if ("ack".equals(type)) {
             Object action = msg.get("action");
             Object topics = msg.get("topics");
@@ -220,7 +251,9 @@ public final class Receiver {
         System.out.println("  # <t> / subscribe <t>       subscribe to topic <t>");
         System.out.println("  ! <t> / unsubscribe <t>     unsubscribe from topic <t>");
         System.out.println("  topics                      list all available topics");
-        System.out.println("  backlog [--topic <t>]       show backlog (all topics if omitted)");
+        System.out.println("  backlog                     show pending counts by topic");
+        System.out.println("  backlog --all               show all backlogged messages");
+        System.out.println("  backlog --topic <t>         show backlogged messages for topic <t>");
         System.out.println("  ?                           show this help");
         System.out.println("  quit                        disconnect and exit");
     }
