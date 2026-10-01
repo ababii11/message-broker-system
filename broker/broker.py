@@ -12,12 +12,12 @@ from typing import Deque, Dict, List, Optional, Set
 LOG = logging.getLogger("broker")
 
 HISTORY_LIMIT = 20  # last N messages kept in RAM per topic, replayed on a *fresh* subscribe
+READ_POOL_SIZE = 4  # concurrent read-only SQLite connections (WAL lets these run alongside the writer)
 
 
 @dataclass
 class ClientConn:
-    """Tracks one connected socket: its (optional) logged-in username and
-    the topics it's currently receiving live pushes for."""
+    # Represents a connected client, whether logged in or not
     writer: asyncio.StreamWriter
     peer: str
     username: Optional[str] = None
@@ -31,10 +31,22 @@ class Broker:
         self.online: Dict[str, ClientConn] = {}  # username -> connection, only while connected
         self.history: Dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
 
-        self.lock = asyncio.Lock()      # guards the in-memory dicts above
-        self.db_lock = asyncio.Lock()   # serializes access to self.conn
+        self.lock = asyncio.Lock()        # guards the in-memory dicts above
+        self.write_lock = asyncio.Lock()  # serializes WRITES only - SQLite allows just one writer
 
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.db_path = db_path
+        self._write_conn = sqlite3.connect(db_path, check_same_thread=False)
+
+        self._read_pool: Optional[asyncio.Queue] = None
+        if db_path != ":memory:":
+            self._write_conn.execute("PRAGMA journal_mode=WAL")
+            self._write_conn.execute("PRAGMA busy_timeout=5000")
+            self._read_pool = asyncio.Queue()
+            for _ in range(READ_POOL_SIZE):
+                read_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+                read_conn.execute("PRAGMA busy_timeout=5000")
+                self._read_pool.put_nowait(read_conn)
+
         self._init_db()
 
     # ---------------------------------------------------------------- #
@@ -42,7 +54,7 @@ class Broker:
     # ---------------------------------------------------------------- #
 
     def _init_db(self):
-        self.conn.executescript(
+        self._write_conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
                 username   TEXT PRIMARY KEY,
@@ -76,25 +88,41 @@ class Broker:
                 ON backlog(username, delivered);
             """
         )
-        self.conn.commit()
-        self.conn.execute("UPDATE users SET connected = 0")
-        self.conn.commit()
+        self._write_conn.commit()
+        self._write_conn.execute("UPDATE users SET connected = 0")
+        self._write_conn.commit()
 
-    async def _db(self, fn, *args):
-        async with self.db_lock:
-            return await asyncio.to_thread(fn, *args)
+    async def _db_write(self, fn, *args):
+        # sqlite allows one writer at a time, serialize all writes through a single connection
+        async with self.write_lock:
+            return await asyncio.to_thread(fn, self._write_conn, *args)
 
-    def _exec(self, query: str, params=()):
-        cur = self.conn.execute(query, params)
-        self.conn.commit()
+    async def _db_read(self, fn, *args):
+        # Check out a connection from the read pool (if any) and run a read-only query on it
+        # This allows multiple concurrent reads to happen in parallel, even while a write is happening
+        if self._read_pool is None:  # ':memory:' fallback: no separate pool
+            async with self.write_lock:
+                return await asyncio.to_thread(fn, self._write_conn, *args)
+        conn = await self._read_pool.get()
+        try:
+            return await asyncio.to_thread(fn, conn, *args)
+        finally:
+            self._read_pool.put_nowait(conn)
+
+    @staticmethod
+    def _exec(conn: sqlite3.Connection, query: str, params=()):
+        cur = conn.execute(query, params)
+        conn.commit()
         return cur.lastrowid
 
-    def _executemany(self, query: str, seq):
-        self.conn.executemany(query, seq)
-        self.conn.commit()
+    @staticmethod
+    def _executemany(conn: sqlite3.Connection, query: str, seq):
+        conn.executemany(query, seq)
+        conn.commit()
 
-    def _query(self, query: str, params=()):
-        return self.conn.execute(query, params).fetchall()
+    @staticmethod
+    def _query(conn: sqlite3.Connection, query: str, params=()):
+        return conn.execute(query, params).fetchall()
 
     # ---------------------------------------------------------------- #
     # Connection lifecycle
@@ -137,7 +165,7 @@ class Broker:
                 self.online.pop(conn.username, None)
 
         if conn.username:
-            await self._db(
+            await self._db_write(
                 self._exec,
                 "UPDATE users SET connected = 0, last_seen = ? WHERE username = ?",
                 (datetime.now(timezone.utc).isoformat(), conn.username),
@@ -188,7 +216,7 @@ class Broker:
             await self._send(conn.writer, {"type": "error", "message": str(e)})
 
     # ---------------------------------------------------------------- #
-    # login — persistent subscriber identity
+    # login - persistent subscriber identity
     # ---------------------------------------------------------------- #
 
     async def _on_login(self, conn: ClientConn, msg: dict):
@@ -200,25 +228,30 @@ class Broker:
             await self._send(conn.writer, {"type": "error", "message": f"already logged in as '{conn.username}'"})
             return
 
+        # the lock only does check-and-reserve of the username in the online dict, no I/O in this critical section
         async with self.lock:
-            if username in self.online:
-                await self._send(conn.writer, {
-                    "type": "login_error",
-                    "message": f"user '{username}' is already connected elsewhere",
-                })
-                return
-            self.online[username] = conn  # reserve the name
+            name_taken = username in self.online
+            if not name_taken:
+                self.online[username] = conn  # reserve the name
+
+        # not in lock because we need to do I/O to check the database for a previous connection
+        if name_taken:
+            await self._send(conn.writer, {
+                "type": "login_error",
+                "message": f"user '{username}' is already connected elsewhere",
+            })
+            return
 
         try:
             conn.username = username
-            await self._db(
+            await self._db_write(
                 self._exec,
                 "INSERT INTO users(username, connected, last_seen) VALUES (?, 1, ?) "
                 "ON CONFLICT(username) DO UPDATE SET connected = 1, last_seen = excluded.last_seen",
                 (username, datetime.now(timezone.utc).isoformat()),
             )
 
-            rows = await self._db(self._query, "SELECT topic FROM subscriptions WHERE username = ?", (username,))
+            rows = await self._db_read(self._query, "SELECT topic FROM subscriptions WHERE username = ?", (username,))
             topics = sorted(r[0] for r in rows)
             async with self.lock:
                 for t in topics:
@@ -227,7 +260,7 @@ class Broker:
 
             await self._send(conn.writer, {"type": "login_ok", "user": username, "subscribed_topics": topics})
 
-            backlog_counts = await self._db(
+            backlog_counts = await self._db_read(
                 self._query,
                 "SELECT topic, COUNT(*) FROM backlog WHERE username = ? AND delivered = 0 GROUP BY topic",
                 (username,),
@@ -242,7 +275,7 @@ class Broker:
             raise
 
     # ---------------------------------------------------------------- #
-    # register_topic — a publisher announces a topic exists, so
+    # register_topic - a publisher announces a topic exists, so
     # subscribers can discover and subscribe to it even before the first
     # actual message is published
     # ---------------------------------------------------------------- #
@@ -252,7 +285,7 @@ class Broker:
         if not topic:
             await self._send(conn.writer, {"type": "error", "message": "register_topic requires 'topic'"})
             return
-        await self._db(
+        await self._db_write(
             self._exec,
             "INSERT OR IGNORE INTO topics(topic, registered_at) VALUES (?, ?)",
             (topic, datetime.now(timezone.utc).isoformat()),
@@ -260,7 +293,7 @@ class Broker:
         await self._send(conn.writer, {"type": "ack", "action": "register_topic", "topic": topic, "status": "ok"})
 
     # ---------------------------------------------------------------- #
-    # subscribe / unsubscribe — persisted per username
+    # subscribe / unsubscribe - persisted per username
     # ---------------------------------------------------------------- #
 
     async def _on_subscribe(self, conn: ClientConn, msg: dict):
@@ -272,13 +305,13 @@ class Broker:
             await self._send(conn.writer, {"type": "error", "message": "subscribe requires 'topics' (list) or 'topic' (str)"})
             return
 
-        registered_rows = await self._db(self._query, "SELECT topic FROM topics")
+        registered_rows = await self._db_read(self._query, "SELECT topic FROM topics")
         registered = {r[0] for r in registered_rows}
         valid = [t for t in topics if t in registered]
         invalid = [t for t in topics if t not in registered]
 
         if valid:
-            await self._db(
+            await self._db_write(
                 self._executemany,
                 "INSERT OR IGNORE INTO subscriptions(username, topic) VALUES (?, ?)",
                 [(conn.username, t) for t in valid],
@@ -297,7 +330,7 @@ class Broker:
         if invalid:
             await self._send(conn.writer, {
                 "type": "error",
-                "message": f"unknown topic(s): {', '.join(invalid)} — no publisher has registered or "
+                "message": f"unknown topic(s): {', '.join(invalid)} - no publisher has registered or "
                            f"published to them yet. Use 'topics' to see what's available.",
             })
 
@@ -306,7 +339,7 @@ class Broker:
             await self._send(conn.writer, {"type": "error", "message": "log in first: {'type':'login','user':'...'}"})
             return
         topics = self._extract_topics(msg)
-        await self._db(
+        await self._db_write(
             self._executemany,
             "DELETE FROM subscriptions WHERE username = ? AND topic = ?",
             [(conn.username, t) for t in topics],
@@ -318,12 +351,12 @@ class Broker:
         await self._send(conn.writer, {"type": "ack", "action": "unsubscribe", "topics": topics, "status": "ok"})
 
     async def _on_list_topics(self, conn: ClientConn, msg: dict):
-        rows = await self._db(self._query, "SELECT topic FROM topics ORDER BY topic")
+        rows = await self._db_read(self._query, "SELECT topic FROM topics ORDER BY topic")
         topics = [r[0] for r in rows]
         await self._send(conn.writer, {"type": "topics", "topics": topics})
 
     # ---------------------------------------------------------------- #
-    # publish — log durably, push to online subscribers, backlog the rest
+    # publish - log durably, push to online subscribers, backlog the rest
     # ---------------------------------------------------------------- #
 
     async def _on_publish(self, conn: ClientConn, msg: dict):
@@ -345,12 +378,12 @@ class Broker:
             "timestamp": timestamp,
         }
 
-        message_id = await self._db(
+        message_id = await self._db_write(
             self._exec,
             "INSERT INTO messages(topic, payload, publisher, timestamp) VALUES (?, ?, ?, ?)",
             (topic, json.dumps(content), sender_name, timestamp),
         )
-        await self._db(
+        await self._db_write(
             self._exec,
             "INSERT OR IGNORE INTO topics(topic, registered_at) VALUES (?, ?)",
             (topic, timestamp),
@@ -361,16 +394,20 @@ class Broker:
             live_targets = list(self.subscribers.get(topic, ()))
             online_usernames = set(self.online.keys())
 
-        sent = 0
-        for w in live_targets:
-            if await self._send(w, envelope):
-                sent += 1
+        # Deliver to every live subscriber concurrently rather than one at a
+        # time - a single slow/congested subscriber socket then only delays
+        # its own delivery, not everyone else's (or the publisher's ack).
+        results = await asyncio.gather(
+            *(self._send(w, envelope) for w in live_targets),
+            return_exceptions=True,
+        )
+        sent = sum(1 for ok in results if ok is True)
 
         # Anyone persistently subscribed but not currently online gets a backlog row.
-        subscriber_rows = await self._db(self._query, "SELECT username FROM subscriptions WHERE topic = ?", (topic,))
+        subscriber_rows = await self._db_read(self._query, "SELECT username FROM subscriptions WHERE topic = ?", (topic,))
         offline_users = [u for (u,) in subscriber_rows if u not in online_usernames]
         if offline_users:
-            await self._db(
+            await self._db_write(
                 self._executemany,
                 "INSERT INTO backlog(username, message_id, topic, delivered) VALUES (?, ?, ?, 0)",
                 [(u, message_id, topic) for u in offline_users],
@@ -382,7 +419,7 @@ class Broker:
         })
 
     # ---------------------------------------------------------------- #
-    # backlog — pull queued messages from while a user was offline
+    # backlog - pull queued messages from while a user was offline
     # ---------------------------------------------------------------- #
 
     async def _on_backlog(self, conn: ClientConn, msg: dict):
@@ -392,7 +429,7 @@ class Broker:
         topic = msg.get("topic")
 
         if topic:
-            rows = await self._db(
+            rows = await self._db_read(
                 self._query,
                 "SELECT b.id, m.topic, m.payload, m.publisher, m.timestamp "
                 "FROM backlog b JOIN messages m ON b.message_id = m.id "
@@ -400,7 +437,7 @@ class Broker:
                 (conn.username, topic),
             )
         else:
-            rows = await self._db(
+            rows = await self._db_read(
                 self._query,
                 "SELECT b.id, m.topic, m.payload, m.publisher, m.timestamp "
                 "FROM backlog b JOIN messages m ON b.message_id = m.id "
@@ -422,7 +459,7 @@ class Broker:
             delivered_ids.append(backlog_id)
 
         if delivered_ids:
-            await self._db(
+            await self._db_write(
                 self._executemany,
                 "UPDATE backlog SET delivered = 1 WHERE id = ?",
                 [(i,) for i in delivered_ids],

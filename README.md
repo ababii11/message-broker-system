@@ -15,6 +15,7 @@ explicitly announces it with `register_topic`.
 If connection to the broker is interrupted, the users and publishers connected to it send out a 'disconnect' message and retry the connection.
 
 The broker defaults to wildcard address 0.0.0.0, because it accepts connections from any network.
+
 IP | Connection Type
 --|--
 192.168.x.x| Wi-Fi / Small office routers

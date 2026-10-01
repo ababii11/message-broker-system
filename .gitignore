@@ -6,8 +6,11 @@
 subscriber.py
 publisher.py
 *.db
-T.md
-test_smoke.py
+*.db-shm
+*.db-wal
+obj/
+bin/
+*.class
 
 # User-specific files
 *.rsuser
