@@ -10,6 +10,7 @@ publisher.py
 *.db-wal
 obj/
 bin/
+target/
 *.class
 
 # User-specific files

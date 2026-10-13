@@ -1,0 +1,42 @@
+syntax = "proto3";
+package broker;
+
+import "google/protobuf/empty.proto";
+
+option csharp_namespace = "MessageBroker.Rpc";
+option java_multiple_files = true;
+option java_package = "messagebroker.rpc";
+
+service Broker {
+  rpc Hello(ConnectRequest) returns (google.protobuf.Empty);    // sender handshake: checks the broker is up, gets logged
+  rpc Publish(Message) returns (PublishReply);                  // anonymous; registers the topic
+  rpc Connect(ConnectRequest) returns (stream Event);           // login + live feed, stays open while online
+  rpc Subscribe(UserTopics) returns (SubscribeReply);
+  rpc Unsubscribe(UserTopics) returns (google.protobuf.Empty);
+  rpc ListTopics(google.protobuf.Empty) returns (Topics);
+  rpc Backlog(BacklogRequest) returns (stream Message);         // topic "" = all topics
+}
+
+message Message {            // timestamp is always server-assigned
+  string topic = 1;
+  string content = 2;
+  string sender = 3;
+  string timestamp = 4;
+  bool backlog = 5;
+}
+message PublishReply { int32 subscribers_notified = 1; int32 backlogged_for = 2; }
+message ConnectRequest { string user = 1; }
+message UserTopics { string user = 1; repeated string topics = 2; }
+message SubscribeReply { repeated string subscribed = 1; repeated string unknown = 2; }
+message Topics { repeated string topics = 1; }
+message BacklogRequest { string user = 1; string topic = 2; }
+
+message Event {
+  oneof kind {
+    Welcome welcome = 1;          // always the first event: the login_ok equivalent
+    BacklogNotice notice = 2;
+    Message message = 3;
+  }
+}
+message Welcome { repeated string subscribed_topics = 1; }
+message BacklogNotice { string topic = 1; int32 count = 2; }

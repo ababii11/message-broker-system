@@ -1,38 +1,49 @@
 import argparse
 import asyncio
-import json
 import logging
-import socket
 import sqlite3
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Deque, Dict, List, Optional, Set
+from typing import Deque, Dict, Optional
+
+import grpc
+from google.protobuf import empty_pb2
+
+# Compiles broker.proto at import time (needs grpcio-tools); broker.proto sits next to this file.
+pb, pb_grpc = grpc.protos_and_services("broker.proto")
 
 LOG = logging.getLogger("broker")
 
 HISTORY_LIMIT = 20  # last N messages kept in RAM per topic, replayed on a *fresh* subscribe
-READ_POOL_SIZE = 4  # concurrent read-only SQLite connections (WAL lets these run alongside the writer)
+# concurrent read-only SQLite connections (WAL lets these run alongside the writer)
+READ_POOL_SIZE = 4
+MAX_NAME = 128      # longest accepted user / topic name
 
 
-@dataclass
-class ClientConn:
-    # Represents a connected client, whether logged in or not
-    writer: asyncio.StreamWriter
-    peer: str
-    username: Optional[str] = None
-    topics: Set[str] = field(default_factory=set)
+def valid_name(name: str) -> bool:
+    return 0 < len(name.strip()) <= MAX_NAME
 
 
-class Broker:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def require(context, ok: bool, detail: str):
+    # Trust boundary: protobuf checks field types, this checks the values.
+    if not ok:
+        await context.abort(grpc.StatusCode.INVALID_ARGUMENT, detail)
+
+
+class Broker(pb_grpc.BrokerServicer):
     def __init__(self, db_path: str):
-        self.clients: Dict[asyncio.StreamWriter, ClientConn] = {}
-        self.subscribers: Dict[str, Set[asyncio.StreamWriter]] = defaultdict(set)
-        self.online: Dict[str, ClientConn] = {}  # username -> connection, only while connected
-        self.history: Dict[str, Deque[dict]] = defaultdict(lambda: deque(maxlen=HISTORY_LIMIT))
+        # username -> queue feeding that user's open Connect stream.
+        # shortcut: queue is unbounded, a stalled client grows RAM; bound it and spill to backlog when that matters.
+        self.online: Dict[str, asyncio.Queue] = {}
+        self.history: Dict[str, Deque] = defaultdict(
+            lambda: deque(maxlen=HISTORY_LIMIT))
 
-        self.lock = asyncio.Lock()        # guards the in-memory dicts above
-        self.write_lock = asyncio.Lock()  # serializes WRITES only - SQLite allows just one writer
+        # serializes WRITES only - SQLite allows just one writer
+        self.write_lock = asyncio.Lock()
 
         self.db_path = db_path
         self._write_conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -43,7 +54,8 @@ class Broker:
             self._write_conn.execute("PRAGMA busy_timeout=5000")
             self._read_pool = asyncio.Queue()
             for _ in range(READ_POOL_SIZE):
-                read_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+                read_conn = sqlite3.connect(
+                    f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
                 read_conn.execute("PRAGMA busy_timeout=5000")
                 self._read_pool.put_nowait(read_conn)
 
@@ -125,388 +137,164 @@ class Broker:
         return conn.execute(query, params).fetchall()
 
     # ---------------------------------------------------------------- #
-    # Connection lifecycle
+    # RPCs. grpc.aio runs every call as its own coroutine, so calls are concurrent;
+    # `online`/`history` are only touched between awaits, so they need no lock.
     # ---------------------------------------------------------------- #
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        peer = writer.get_extra_info("peername")
-        peer_str = f"{peer[0]}:{peer[1]}" if peer else "unknown"
+    async def _require_online(self, context, user: str):
+        # shortcut: `user` is an unauthenticated claim (before, identity was bound to the socket), add auth/tokens before untrusted networks.
+        if user not in self.online:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "call Connect(user) first and keep that stream open")
 
-        sock = writer.get_extra_info("socket")
-        if sock is not None:
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            except OSError:
-                pass
+    async def Hello(self, request, context):
+        await require(context, valid_name(request.user), f"user must be 1-{MAX_NAME} non-blank characters")
+        LOG.info("Sender connected: %s (%s)", request.user, context.peer())
+        return empty_pb2.Empty()
 
-        conn = ClientConn(writer=writer, peer=peer_str)
-        self.clients[writer] = conn
-        LOG.info("Client connected: %s", peer_str)
-
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break  # EOF: peer closed the socket
-                await self._process_line(conn, line)
-        except (ConnectionResetError, asyncio.IncompleteReadError):
-            pass
-        except Exception:
-            LOG.exception("Unexpected error handling client %s", peer_str)
-        finally:
-            await self._disconnect(conn)
-
-    async def _disconnect(self, conn: ClientConn):
-        async with self.lock:
-            self.clients.pop(conn.writer, None)
-            for topic in conn.topics:
-                self.subscribers[topic].discard(conn.writer)
-            if conn.username:
-                self.online.pop(conn.username, None)
-
-        if conn.username:
-            await self._db_write(
-                self._exec,
-                "UPDATE users SET connected = 0, last_seen = ? WHERE username = ?",
-                (datetime.now(timezone.utc).isoformat(), conn.username),
-            )
-
-        try:
-            conn.writer.close()
-            await conn.writer.wait_closed()
-        except Exception:
-            pass
-        LOG.info("Client disconnected: %s (user=%s)", conn.peer, conn.username)
-
-    # ---------------------------------------------------------------- #
-    # Message dispatch
-    # ---------------------------------------------------------------- #
-
-    async def _process_line(self, conn: ClientConn, raw: bytes):
-        try:
-            text = raw.decode("utf-8").strip()
-            if not text:
-                return
-            msg = json.loads(text)
-            if not isinstance(msg, dict):
-                raise ValueError("top-level JSON must be an object")
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
-            await self._send(conn.writer, {"type": "error", "message": f"invalid message: {e}"})
-            return
-
-        handler = {
-            "login": self._on_login,
-            "register_topic": self._on_register_topic,
-            "subscribe": self._on_subscribe,
-            "unsubscribe": self._on_unsubscribe,
-            "list_topics": self._on_list_topics,
-            "publish": self._on_publish,
-            "message": self._on_publish,  # accepted alias
-            "backlog": self._on_backlog,
-        }.get(msg.get("type"))
-
-        if handler is None:
-            await self._send(conn.writer, {"type": "error", "message": f"unknown type '{msg.get('type')}'"})
-            return
-
-        try:
-            await handler(conn, msg)
-        except Exception as e:
-            LOG.exception("Error handling message from %s", conn.peer)
-            await self._send(conn.writer, {"type": "error", "message": str(e)})
-
-    # ---------------------------------------------------------------- #
-    # login - persistent subscriber identity
-    # ---------------------------------------------------------------- #
-
-    async def _on_login(self, conn: ClientConn, msg: dict):
-        username = msg.get("user")
-        if not username or not isinstance(username, str):
-            await self._send(conn.writer, {"type": "error", "message": "login requires a 'user' string"})
-            return
-        if conn.username:
-            await self._send(conn.writer, {"type": "error", "message": f"already logged in as '{conn.username}'"})
-            return
-
-        # the lock only does check-and-reserve of the username in the online dict, no I/O in this critical section
-        async with self.lock:
-            name_taken = username in self.online
-            if not name_taken:
-                self.online[username] = conn  # reserve the name
-
-        # not in lock because we need to do I/O to check the database for a previous connection
-        if name_taken:
-            await self._send(conn.writer, {
-                "type": "login_error",
-                "message": f"user '{username}' is already connected elsewhere",
-            })
-            return
-
-        try:
-            conn.username = username
-            await self._db_write(
-                self._exec,
-                "INSERT INTO users(username, connected, last_seen) VALUES (?, 1, ?) "
-                "ON CONFLICT(username) DO UPDATE SET connected = 1, last_seen = excluded.last_seen",
-                (username, datetime.now(timezone.utc).isoformat()),
-            )
-
-            rows = await self._db_read(self._query, "SELECT topic FROM subscriptions WHERE username = ?", (username,))
-            topics = sorted(r[0] for r in rows)
-            async with self.lock:
-                for t in topics:
-                    self.subscribers[t].add(conn.writer)
-                    conn.topics.add(t)
-
-            await self._send(conn.writer, {"type": "login_ok", "user": username, "subscribed_topics": topics})
-
-            backlog_counts = await self._db_read(
-                self._query,
-                "SELECT topic, COUNT(*) FROM backlog WHERE username = ? AND delivered = 0 GROUP BY topic",
-                (username,),
-            )
-            for topic, count in backlog_counts:
-                await self._send(conn.writer, {"type": "backlog_notice", "topic": topic, "count": count})
-
-        except Exception:
-            async with self.lock:
-                self.online.pop(username, None)
-            conn.username = None
-            raise
-
-    # ---------------------------------------------------------------- #
-    # register_topic - a publisher announces a topic exists, so
-    # subscribers can discover and subscribe to it even before the first
-    # actual message is published
-    # ---------------------------------------------------------------- #
-
-    async def _on_register_topic(self, conn: ClientConn, msg: dict):
-        topic = msg.get("topic")
-        if not topic:
-            await self._send(conn.writer, {"type": "error", "message": "register_topic requires 'topic'"})
-            return
-        await self._db_write(
-            self._exec,
-            "INSERT OR IGNORE INTO topics(topic, registered_at) VALUES (?, ?)",
-            (topic, datetime.now(timezone.utc).isoformat()),
-        )
-        await self._send(conn.writer, {"type": "ack", "action": "register_topic", "topic": topic, "status": "ok"})
-
-    # ---------------------------------------------------------------- #
-    # subscribe / unsubscribe - persisted per username
-    # ---------------------------------------------------------------- #
-
-    async def _on_subscribe(self, conn: ClientConn, msg: dict):
-        if not conn.username:
-            await self._send(conn.writer, {"type": "error", "message": "log in first: {'type':'login','user':'...'}"})
-            return
-        topics = self._extract_topics(msg)
-        if not topics:
-            await self._send(conn.writer, {"type": "error", "message": "subscribe requires 'topics' (list) or 'topic' (str)"})
-            return
-
-        registered_rows = await self._db_read(self._query, "SELECT topic FROM topics")
-        registered = {r[0] for r in registered_rows}
-        valid = [t for t in topics if t in registered]
-        invalid = [t for t in topics if t not in registered]
-
-        if valid:
-            await self._db_write(
-                self._executemany,
-                "INSERT OR IGNORE INTO subscriptions(username, topic) VALUES (?, ?)",
-                [(conn.username, t) for t in valid],
-            )
-            async with self.lock:
-                for t in valid:
-                    self.subscribers[t].add(conn.writer)
-                    conn.topics.add(t)
-
-            await self._send(conn.writer, {"type": "ack", "action": "subscribe", "topics": valid, "status": "ok"})
-            # Replay recent live history for topics that are new to this user.
-            for t in valid:
-                for past in list(self.history[t]):
-                    await self._send(conn.writer, past)
-
-        if invalid:
-            await self._send(conn.writer, {
-                "type": "error",
-                "message": f"unknown topic(s): {', '.join(invalid)} - no publisher has registered or "
-                           f"published to them yet. Use 'topics' to see what's available.",
-            })
-
-    async def _on_unsubscribe(self, conn: ClientConn, msg: dict):
-        if not conn.username:
-            await self._send(conn.writer, {"type": "error", "message": "log in first: {'type':'login','user':'...'}"})
-            return
-        topics = self._extract_topics(msg)
-        await self._db_write(
-            self._executemany,
-            "DELETE FROM subscriptions WHERE username = ? AND topic = ?",
-            [(conn.username, t) for t in topics],
-        )
-        async with self.lock:
-            for t in topics:
-                self.subscribers[t].discard(conn.writer)
-                conn.topics.discard(t)
-        await self._send(conn.writer, {"type": "ack", "action": "unsubscribe", "topics": topics, "status": "ok"})
-
-    async def _on_list_topics(self, conn: ClientConn, msg: dict):
-        rows = await self._db_read(self._query, "SELECT topic FROM topics ORDER BY topic")
-        topics = [r[0] for r in rows]
-        await self._send(conn.writer, {"type": "topics", "topics": topics})
-
-    # ---------------------------------------------------------------- #
-    # publish - log durably, push to online subscribers, backlog the rest
-    # ---------------------------------------------------------------- #
-
-    async def _on_publish(self, conn: ClientConn, msg: dict):
-        topic = msg.get("topic")
-        if not topic:
-            await self._send(conn.writer, {"type": "error", "message": "publish requires 'topic'"})
-            return
-        content = msg.get("content", msg.get("payload", ""))
-        sender_name = msg.get("sender", conn.peer)
-        
-        # Extragem timestamp din mesajul primit, sau generăm unul nou
-        timestamp = msg.get("timestamp", datetime.now(timezone.utc).isoformat())
-        
-        envelope = {
-            "type": "message",
-            "topic": topic,
-            "content": content,
-            "sender": sender_name,
-            "timestamp": timestamp,
-        }
+    async def Publish(self, request, context):
+        await require(context, valid_name(request.topic), f"topic must be 1-{MAX_NAME} non-blank characters")
+        topic, sender, timestamp = request.topic, request.sender or context.peer(), now_iso()
+        message = pb.Message(topic=topic, content=request.content,
+                             sender=sender, timestamp=timestamp)
 
         message_id = await self._db_write(
             self._exec,
             "INSERT INTO messages(topic, payload, publisher, timestamp) VALUES (?, ?, ?, ?)",
-            (topic, json.dumps(content), sender_name, timestamp),
+            (topic, request.content, sender, timestamp),
         )
-        await self._db_write(
-            self._exec,
-            "INSERT OR IGNORE INTO topics(topic, registered_at) VALUES (?, ?)",
-            (topic, timestamp),
-        )
+        await self._db_write(self._exec, "INSERT OR IGNORE INTO topics(topic, registered_at) VALUES (?, ?)", (topic, timestamp))
+        self.history[topic].append(message)
 
-        async with self.lock:
-            self.history[topic].append(envelope)
-            live_targets = list(self.subscribers.get(topic, ()))
-            online_usernames = set(self.online.keys())
-
-        # Deliver to every live subscriber concurrently rather than one at a
-        # time - a single slow/congested subscriber socket then only delays
-        # its own delivery, not everyone else's (or the publisher's ack).
-        results = await asyncio.gather(
-            *(self._send(w, envelope) for w in live_targets),
-            return_exceptions=True,
-        )
-        sent = sum(1 for ok in results if ok is True)
-
-        # Anyone persistently subscribed but not currently online gets a backlog row.
-        subscriber_rows = await self._db_read(self._query, "SELECT username FROM subscriptions WHERE topic = ?", (topic,))
-        offline_users = [u for (u,) in subscriber_rows if u not in online_usernames]
-        if offline_users:
+        rows = await self._db_read(self._query, "SELECT username FROM subscriptions WHERE topic = ?", (topic,))
+        subscribers = [row[0] for row in rows]
+        live = [u for u in subscribers if u in self.online]
+        offline = [u for u in subscribers if u not in self.online]
+        for user in live:
+            self.online[user].put_nowait(pb.Event(message=message))
+        if offline:
             await self._db_write(
                 self._executemany,
                 "INSERT INTO backlog(username, message_id, topic, delivered) VALUES (?, ?, ?, 0)",
-                [(u, message_id, topic) for u in offline_users],
+                [(user, message_id, topic) for user in offline],
             )
+        return pb.PublishReply(subscribers_notified=len(live), backlogged_for=len(offline))
 
-        await self._send(conn.writer, {
-            "type": "ack", "action": "publish", "topic": topic,
-            "status": "ok", "subscribers_notified": sent, "backlogged_for": len(offline_users),
-        })
+    async def Connect(self, request, context):
+        user = request.user
+        await require(context, valid_name(user), f"user must be 1-{MAX_NAME} non-blank characters")
+        if user in self.online:  # no await between this check and the assignment below, so it is atomic
+            await context.abort(grpc.StatusCode.ALREADY_EXISTS, f"user '{user}' is already connected elsewhere")
+        queue = self.online[user] = asyncio.Queue()
+        LOG.info("Receiver connected: %s (%s)", user, context.peer())
+        try:
+            await self._db_write(
+                self._exec,
+                "INSERT INTO users(username, connected, last_seen) VALUES (?, 1, ?) "
+                "ON CONFLICT(username) DO UPDATE SET connected = 1, last_seen = excluded.last_seen",
+                (user, now_iso()),
+            )
+            rows = await self._db_read(self._query, "SELECT topic FROM subscriptions WHERE username = ?", (user,))
+            yield pb.Event(welcome=pb.Welcome(subscribed_topics=sorted(row[0] for row in rows)))
 
-    # ---------------------------------------------------------------- #
-    # backlog - pull queued messages from while a user was offline
-    # ---------------------------------------------------------------- #
-
-    async def _on_backlog(self, conn: ClientConn, msg: dict):
-        if not conn.username:
-            await self._send(conn.writer, {"type": "error", "message": "log in first: {'type':'login','user':'...'}"})
-            return
-        topic = msg.get("topic")
-
-        if topic:
-            rows = await self._db_read(
+            counts = await self._db_read(
                 self._query,
-                "SELECT b.id, m.topic, m.payload, m.publisher, m.timestamp "
-                "FROM backlog b JOIN messages m ON b.message_id = m.id "
-                "WHERE b.username = ? AND b.delivered = 0 AND b.topic = ? ORDER BY m.id",
-                (conn.username, topic),
+                "SELECT topic, COUNT(*) FROM backlog WHERE username = ? AND delivered = 0 GROUP BY topic",
+                (user,),
             )
-        else:
-            rows = await self._db_read(
-                self._query,
-                "SELECT b.id, m.topic, m.payload, m.publisher, m.timestamp "
-                "FROM backlog b JOIN messages m ON b.message_id = m.id "
-                "WHERE b.username = ? AND b.delivered = 0 ORDER BY m.id",
-                (conn.username,),
+            for topic, count in counts:
+                yield pb.Event(notice=pb.BacklogNotice(topic=topic, count=count))
+
+            while True:  # ends when the client goes away: grpc cancels this coroutine at the await
+                yield await queue.get()
+        finally:
+            LOG.info("Receiver disconnected: %s", user)
+            self.online.pop(user, None)
+            await self._db_write(
+                self._exec, "UPDATE users SET connected = 0, last_seen = ? WHERE username = ?", (now_iso(
+                ), user)
             )
 
-        delivered_ids = []
-        for backlog_id, mtopic, payload_json, publisher, timestamp in rows:
-            envelope = {
-                "type": "message",
-                "topic": mtopic,
-                "payload": json.loads(payload_json),
-                "publisher": publisher,
-                "timestamp": timestamp,
-                "backlog": True,
-            }
-            await self._send(conn.writer, envelope)
-            delivered_ids.append(backlog_id)
-
-        if delivered_ids:
+    async def Subscribe(self, request, context):
+        await self._require_online(context, request.user)
+        rows = await self._db_read(self._query, "SELECT topic FROM topics")
+        registered = {row[0] for row in rows}
+        valid = [t for t in request.topics if t in registered]
+        unknown = [t for t in request.topics if t not in registered]
+        if valid:
             await self._db_write(
                 self._executemany,
-                "UPDATE backlog SET delivered = 1 WHERE id = ?",
-                [(i,) for i in delivered_ids],
+                "INSERT OR IGNORE INTO subscriptions(username, topic) VALUES (?, ?)",
+                [(request.user, t) for t in valid],
             )
+            # may have disconnected during the awaits above
+            queue = self.online.get(request.user)
+            if queue:
+                for topic in valid:
+                    for past in self.history[topic]:
+                        queue.put_nowait(pb.Event(message=past))
+        return pb.SubscribeReply(subscribed=valid, unknown=unknown)
 
-        await self._send(conn.writer, {
-            "type": "ack", "action": "backlog", "topic": topic, "count": len(delivered_ids),
-        })
+    async def Unsubscribe(self, request, context):
+        await self._require_online(context, request.user)
+        await self._db_write(
+            self._executemany,
+            "DELETE FROM subscriptions WHERE username = ? AND topic = ?",
+            [(request.user, t) for t in request.topics],
+        )
+        return empty_pb2.Empty()
 
-    # ---------------------------------------------------------------- #
-    # shared helpers
-    # ---------------------------------------------------------------- #
+    async def ListTopics(self, request, context):
+        rows = await self._db_read(self._query, "SELECT topic FROM topics ORDER BY topic")
+        return pb.Topics(topics=[row[0] for row in rows])
 
-    @staticmethod
-    def _extract_topics(msg: dict) -> List[str]:
-        if isinstance(msg.get("topics"), list):
-            return [str(t) for t in msg["topics"]]
-        if msg.get("topic"):
-            return [str(msg["topic"])]
-        return []
+    async def Backlog(self, request, context):
+        await self._require_online(context, request.user)
+        query = (
+            "SELECT b.id, m.topic, m.payload, m.publisher, m.timestamp "
+            "FROM backlog b JOIN messages m ON b.message_id = m.id "
+            "WHERE b.username = ? AND b.delivered = 0"
+        )
+        params = (request.user,)
+        if request.topic:
+            query, params = query + \
+                " AND b.topic = ?", params + (request.topic,)
+        rows = await self._db_read(self._query, query + " ORDER BY m.id", params)
 
-    async def _send(self, writer: asyncio.StreamWriter, obj: dict) -> bool:
+        sent = []
         try:
-            writer.write((json.dumps(obj) + "\n").encode("utf-8"))
-            await writer.drain()
-            return True
-        except (ConnectionResetError, BrokenPipeError):
-            return False
+            for backlog_id, topic, content, sender, timestamp in rows:
+                yield pb.Message(topic=topic, content=content, sender=sender, timestamp=timestamp, backlog=True)
+                sent.append(backlog_id)
+        finally:  # a client that drops mid-stream only consumes what it actually received
+            if sent:
+                await self._db_write(
+                    self._executemany, "UPDATE backlog SET delivered = 1 WHERE id = ?", [
+                        (i,) for i in sent]
+                )
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Pub/Sub message broker with persistent subscribers")
+    parser = argparse.ArgumentParser(
+        description="Pub/Sub message broker (gRPC) with persistent subscribers")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--db", default="broker_database.db", help="SQLite file (':memory:' for a non-persistent run)")
+    parser.add_argument("--db", default="broker_database.db",
+                        help="SQLite file (':memory:' for a non-persistent run)")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
 
-    broker = Broker(db_path=args.db)
-    server = await asyncio.start_server(broker.handle_client, args.host, args.port)
-
-    addr = ", ".join(str(s.getsockname()) for s in server.sockets)
-    LOG.info("Broker listening on %s (db=%s)", addr, args.db)
-
-    async with server:
-        await server.serve_forever()
+    # HTTP/2 pings drop dead peers, so a crashed client cannot hold its username forever.
+    server = grpc.aio.server(
+        options=[("grpc.keepalive_time_ms", 30000), ("grpc.keepalive_timeout_ms", 10000)])
+    pb_grpc.add_BrokerServicer_to_server(Broker(args.db), server)
+    # shortcut: plaintext HTTP/2, add TLS (add_secure_port) before leaving a trusted LAN.
+    server.add_insecure_port(f"{args.host}:{args.port}")
+    await server.start()
+    LOG.info("Broker listening on %s:%s (db=%s)",
+             args.host, args.port, args.db)
+    await server.wait_for_termination()
 
 
 if __name__ == "__main__":
