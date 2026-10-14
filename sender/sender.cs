@@ -1,81 +1,34 @@
 #nullable disable
 using System;
 using System.Diagnostics;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text.Json;
 using System.Threading;
+using Grpc.Net.Client;
+using MessageBroker.Rpc;
 
 namespace MessageBroker.Sender
 {
-    public class LoginMessage
-    {
-        public string type { get; set; } = "login";
-        public string user { get; set; }
-    }
-
-    public class PublishMessage
-    {
-        public string type { get; set; } = "publish";
-        public string sender { get; set; }
-        public string topic { get; set; }
-        public string content { get; set; }
-        public string timestamp { get; set; }
-    }
-
     public class BrokerClient : IDisposable
     {
-        private readonly TcpClient _client;
-        private StreamReader _reader;
-        private StreamWriter _writer;
+        private GrpcChannel _channel;
+        private Broker.BrokerClient _stub;
         private string _senderName;
-
-        public BrokerClient(int localPort)
-        {
-            // Asignăm un port local diferit și unic
-            IPEndPoint localEndPoint = new IPEndPoint(IPAddress.Loopback, localPort);
-            _client = new TcpClient(localEndPoint);
-        }
 
         public void Connect(string host, int port, string senderName)
         {
             _senderName = senderName;
-            _client.Connect(host, port);
-            
-            var stream = _client.GetStream();
-            _reader = new StreamReader(stream);
-            _writer = new StreamWriter(stream) { AutoFlush = true };
-
-            var loginMsg = new LoginMessage { user = senderName };
-            _writer.WriteLine(JsonSerializer.Serialize(loginMsg));
-            
-            string response = _reader.ReadLine();
-            if (response == null || !response.Contains("\"login_ok\""))
-                throw new IOException($"Brokerul a respins inregistrarea: {response}");
+            // shortcut: plaintext HTTP/2, use https + TLS before leaving a trusted LAN
+            _channel = GrpcChannel.ForAddress($"http://{host}:{port}");
+            _stub = new Broker.BrokerClient(_channel);
+            // handshake: throws if the broker is down (like TcpClient.Connect did) and lets the broker log this sender
+            _stub.Hello(new ConnectRequest { User = senderName }, deadline: DateTime.UtcNow.AddSeconds(10));
         }
 
-        public string Publish(string topic, string content)
-        {
-            var message = new PublishMessage 
-            { 
-                sender = _senderName,
-                topic = topic.Trim(), 
-                content = content.Trim(),
-                timestamp = DateTime.UtcNow.ToString("O")
-            };
-            _writer.WriteLine(JsonSerializer.Serialize(message));
-            return _reader.ReadLine();
-        }
+        public PublishReply Publish(string topic, string content) =>
+            _stub.Publish(
+                new Message { Sender = _senderName, Topic = topic.Trim(), Content = content.Trim() },
+                deadline: DateTime.UtcNow.AddSeconds(10)); // a hung broker must not freeze this terminal forever
 
-        public string GetLocalEndpoint() => _client.Client.LocalEndPoint.ToString();
-
-        public void Dispose()
-        {
-            _reader?.Dispose();
-            _writer?.Dispose();
-            _client?.Dispose();
-        }
+        public void Dispose() => _channel?.Dispose();
     }
 
     class Program
@@ -86,8 +39,7 @@ namespace MessageBroker.Sender
             if (args.Length > 0 && args[0] == "child")
             {
                 int senderId = int.Parse(args[1]);
-                int localPort = int.Parse(args[2]);
-                RunInteractiveChild(senderId, localPort);
+                RunInteractiveChild(senderId);
             }
             else
             {
@@ -101,7 +53,7 @@ namespace MessageBroker.Sender
         static void RunSpawner()
         {
             Console.WriteLine("=== MASTER SENDER ===");
-            
+
             // Identificam cum a fost pornit programul (.exe direct sau prin dotnet run)
             string exePath = Process.GetCurrentProcess().MainModule.FileName;
             string dllPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
@@ -112,7 +64,7 @@ namespace MessageBroker.Sender
                 Console.WriteLine("\n------------------------------------------------");
                 Console.Write("Introdu numarul de noi terminale cu senderi pe care doriti sa le deschideti (sau 'q' pt a iesi): ");
                 string input = Console.ReadLine()?.Trim();
-                
+
                 if (input.ToLower() == "q" || input.ToLower() == "quit" || input.ToLower() == "exit")
                 {
                     break;
@@ -127,29 +79,27 @@ namespace MessageBroker.Sender
                 for (int i = 1; i <= x; i++)
                 {
                     globalSenderCounter++;
-                    int port = 51000 + globalSenderCounter;
-                    
                     ProcessStartInfo psi = new ProcessStartInfo();
-                    
+
                     if (isDotNet)
                     {
                         psi.FileName = exePath;
-                        psi.Arguments = $"\"{dllPath}\" child {globalSenderCounter} {port}";
+                        psi.Arguments = $"\"{dllPath}\" child {globalSenderCounter}";
                     }
                     else
                     {
                         psi.FileName = exePath;
-                        psi.Arguments = $"child {globalSenderCounter} {port}";
+                        psi.Arguments = $"child {globalSenderCounter}";
                     }
-                    
+
                     // Setarea magica pe Windows: deschide fizic o fereastra CMD noua pentru fiecare proces
-                    psi.UseShellExecute = true; 
-                    
+                    psi.UseShellExecute = true;
+
                     try
                     {
                         Process.Start(psi);
                     }
-                    catch(Exception e)
+                    catch (Exception e)
                     {
                         Console.WriteLine($"Eroare la deschiderea terminalului {globalSenderCounter}: {e.Message}");
                     }
@@ -160,7 +110,7 @@ namespace MessageBroker.Sender
             }
         }
 
-        static void RunInteractiveChild(int senderId, int localPort)
+        static void RunInteractiveChild(int senderId)
         {
             string host = "127.0.0.1";
             int brokerPort = 9000;
@@ -170,7 +120,7 @@ namespace MessageBroker.Sender
             Console.WriteLine(new string('=', 50));
             Console.WriteLine($" TERMINAL SENDER INTERACTIV | {senderName} ");
             Console.WriteLine(new string('=', 50));
-            
+
             string topic = "";
             Mutex topicMutex = null;
 
@@ -179,7 +129,7 @@ namespace MessageBroker.Sender
             {
                 Console.Write("Alege Topic-ul UNIC pentru acest terminal (ex: sport): ");
                 topic = Console.ReadLine()?.Trim().ToLower();
-                
+
                 if (string.IsNullOrEmpty(topic)) continue;
                 if (topic == "exit" || topic == "quit") return;
 
@@ -208,11 +158,10 @@ namespace MessageBroker.Sender
                 {
                     try
                     {
-                        using (var client = new BrokerClient(localPort))
+                        using (var client = new BrokerClient())
                         {
                             client.Connect(host, brokerPort, senderName);
-                            Console.WriteLine($"[+] Conectat la Brokerul de pe {host}:{brokerPort}");
-                            Console.WriteLine($"[+] Portul Meu Local: {client.GetLocalEndpoint()}\n");
+                            Console.WriteLine($"[+] Conectat la Brokerul de pe {host}:{brokerPort}\n");
 
                             // 2. Bucla infinita doar pentru mesaje
                             while (true)
@@ -223,13 +172,8 @@ namespace MessageBroker.Sender
                                 if (string.IsNullOrEmpty(content)) continue;
                                 if (content.ToLower() == "exit" || content.ToLower() == "quit") return;
 
-                                string response = client.Publish(topic, content);
-                                if (response == null)
-                                {
-                                    throw new IOException("Brokerul a intrerupt conexiunea (EOF).");
-                                }
-                                
-                                Console.WriteLine($"  -> [Broker a confirmat]: {response}\n");
+                                var reply = client.Publish(topic, content);
+                                Console.WriteLine($"  -> [Broker a confirmat]: {reply}\n");
                             }
                         }
                     }
@@ -238,9 +182,6 @@ namespace MessageBroker.Sender
                         Console.WriteLine($"\n[!] Eroare de conexiune / Broker picat: {ex.Message}");
                         Console.WriteLine("[*] Reincercam reconectarea automata in 3 secunde...");
                         Thread.Sleep(3000);
-                        
-                        // Incrementam portul local pentru a evita TIME_WAIT blocaj la reconectare
-                        localPort++; 
                     }
                 }
             }
